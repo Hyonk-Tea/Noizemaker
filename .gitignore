@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.DS_Store
+Thumbs.db
+
+backups/
+config.ini
+mods/
+packaging/
+legacy_python/
+NOIZEMAKER_FORMAT_NOTES.md
