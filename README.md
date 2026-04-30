@@ -1,8 +1,17 @@
 # Noizemaker
 
-DGSH parsing, rebuild, editor UI, and mod-management work for the Lua/LOVE port of Noizemaker.
+Noizemaker is a Lua/LÖVE rewrite of the Space Channel 5 Part 2 rhythm editor and patcher.
 
-## Run the app
+The current repo includes:
+
+- a DGSH parser and rebuild pipeline
+- a desktop editor UI built with LÖVE
+- mod install / enable / disable support
+- backend fixture tests for the tricky binary cases
+
+The older Python implementation is still preserved locally as `legacy_python/`, but the Lua version is now the main project.
+
+## Running the app
 
 From the repo root:
 
@@ -10,21 +19,27 @@ From the repo root:
 love .
 ```
 
-On first launch, the app reads `config.ini`. If `game_root` is missing or invalid, it will prompt for your Space Channel 5 Part 2 root directory.
+On first launch, Noizemaker looks for `config.ini`. If `game_root` is missing or invalid, it will prompt you for your Space Channel 5 Part 2 install folder.
 
-## Edit a sequence
+## Editing a sequence
 
-1. Use `Open` to load a DGSH `.bin` file.
-2. Select an entry from the left panel.
-3. Edit the working copy in the timeline or inspector:
-   - click a node to inspect it
-   - drag a node left or right to change its tick position
-   - use `Place Move` to arm a move, then click the timeline to place it
-   - use the inspector to change move type, RAW byte, gap, tick, timing, or start delay
-4. Press `Apply` to commit the current entry into the pending mods table.
-5. Press `Patch` or `Ctrl+S` to write a patched copy of the loaded file.
+The normal flow is:
 
-Modified entries are marked with `*` in the entry list. Invalid edits are blocked before apply or patch, and validation messages appear in the inspector and status line.
+1. Open a DGSH `.bin` file.
+2. Pick an entry from the left panel.
+3. Edit the working copy in the timeline or inspector.
+4. Press `Apply` to store that entry in the pending patch set.
+5. Press `Patch` or `Ctrl+S` to write a patched copy.
+
+The editor supports:
+
+- clicking a node to inspect it
+- dragging steps left and right on the timeline
+- placing new steps by arming a move and clicking the timeline
+- editing move type, RAW byte, gap, tick, timing, and start delay
+- undo / redo
+
+Modified entries are marked in the entry list. Invalid edits are blocked before apply or patch, and the UI will show the validation reason.
 
 ## Shortcuts
 
@@ -34,19 +49,17 @@ Modified entries are marked with `*` in the entry list. Invalid edits are blocke
 - `Ctrl+S`: patch a copy
 - `Escape`: clear step selection or cancel move placement
 
-## Mods tab
+## Mods
 
-Use the `Mods` button in the top-right corner to switch to the Mods view.
+The `Mods` button opens the built-in mod manager. It can:
 
-The Mods view supports:
+- install `.zip` Noizemaker mods
+- accept drag-and-drop zip installs
+- enable and disable installed mods
+- uninstall mods
+- restore backed-up original files
 
-- installing `.zip` Noizemaker mods
-- drag-and-drop zip install while the Mods tab is open
-- enabling and disabling installed mods
-- uninstalling mods
-- restoring original backed-up game files
-
-Installed mods are unpacked into:
+Installed mods unpack into:
 
 ```text
 mods/
@@ -58,7 +71,7 @@ mods/
       R1.BIN
 ```
 
-Backups are stored separately and are never deleted by uninstall:
+Original files are backed up separately:
 
 ```text
 backups/
@@ -67,13 +80,13 @@ backups/
     r11cap_e.bin
 ```
 
-The backup tree mirrors the game-root-relative file layout.
+That backup tree mirrors the game-root-relative file layout.
 
-## noizemaker.yaml
+## Mod manifest
 
-Each mod zip must include `noizemaker.yaml` at the archive root, or inside a single top-level folder.
+Each mod zip needs a `noizemaker.yaml` at the archive root, or inside a single top-level folder.
 
-Minimal example:
+Example:
 
 ```yaml
 name: Example Mod Name
@@ -94,47 +107,19 @@ Required fields:
 - `description`
 - `changed_files`
 
-Supported optional fields:
+Optional fields currently supported:
 
 - `author`
 - `game_version`
 - `homepage`
 
-The v1 parser is intentionally simple:
+The parser is intentionally simple for now:
 
 - `key: value` fields
-- `changed_files` as a `- item` list
-- multiline YAML values are not supported yet
+- `changed_files` as `- item` entries
+- no multiline YAML values yet
 
-## Installing and enabling mods
-
-1. Open the `Mods` tab.
-2. Click `Install Mod...` or drag a `.zip` onto the window while the tab is open.
-3. After install, select the mod and click `Enable`.
-
-When enabling a mod, Noizemaker:
-
-1. checks for file conflicts with already enabled mods
-2. backs up original game files into `backups/original/` if they are not already backed up
-3. copies the modded files from `mods/<mod_name>/files/` into the game root
-
-If two mods change the same file, enabling the second mod is blocked until the conflicting mod is disabled.
-
-## Disabling and restoring
-
-- `Disable` restores each changed file from `backups/original/`
-- `Restore Originals` restores every backed-up original file into the game root and clears the enabled-mod state
-
-If a mod introduced a changed file that had no original backup, disabling or restoring removes that modded file.
-
-## Notes
-
-- Current mod-management support is Windows-first.
-- Mod zip extraction uses PowerShell on Windows.
-- Exporting the current editor state as a distributable mod zip is not implemented yet.
-- `legacy_python/` contains the older Python implementation for reference.
-
-## Run backend tests
+## Backend tests
 
 From the repo root:
 
@@ -142,13 +127,44 @@ From the repo root:
 lua .\tests\backend_tests.lua
 ```
 
-If `lua` is not on `PATH`, use your full Lua executable path instead.
+If `lua` is not on `PATH`, use the full path to your Lua executable instead.
 
-The backend test runner uses the binary fixtures in `fixtures/` and checks:
+The fixture suite checks:
 
 - vanilla DGSH parsing
-- no-op rebuild byte identity
-- a known simple edit against an expected patched fixture
-- PS007-style Rescue Section expansion and local ID growth
-- odd/even start-delay encoding
+- no-op rebuild identity
+- a known simple edit
+- PS007-style Rescue Section expansion
+- odd / even start-delay encoding
 - timing-only rebuild edits
+
+## Automatic Windows builds
+
+This repo includes a GitHub Actions workflow that builds a Windows package automatically. Every run uploads a downloadable artifact containing:
+
+- `noizemaker.exe`
+- the required LÖVE runtime DLLs
+- a packaged `.love` file
+- the project README
+
+The workflow lives at:
+
+```text
+.github/workflows/build-windows.yml
+```
+
+It calls:
+
+```powershell
+.\scripts\build_windows_package.ps1
+```
+
+So the same packaging process can be run locally if you want to reproduce the GitHub build.
+
+If you push a tag like `v0.1.0`, the workflow will also create or update a GitHub Release for that tag and attach `noizemaker-windows.zip` as a release asset.
+
+## Notes
+
+- Mod-management is Windows-first right now.
+- Mod zip extraction currently relies on PowerShell on Windows.
+- Exporting the current editor state as a distributable mod zip is still not implemented.

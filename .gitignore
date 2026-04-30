@@ -12,3 +12,5 @@ mods/
 packaging/
 legacy_python/
 NOIZEMAKER_FORMAT_NOTES.md
+.build/
+dist/
