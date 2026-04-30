@@ -2,16 +2,11 @@
 
 Noizemaker is a Lua/LÖVE rewrite of the Space Channel 5 Part 2 rhythm editor and patcher.
 
-The current repo includes:
-
-- a DGSH parser and rebuild pipeline
-- a desktop editor UI built with LÖVE
-- mod install / enable / disable support
-- backend fixture tests for the tricky binary cases
-
-The older Python implementation is still preserved locally as `legacy_python/`, but the Lua version is now the main project.
-
 ## Running the app
+
+Ideally, download the .zip from the Releases tab on the right.
+
+Otherwise;
 
 From the repo root:
 
