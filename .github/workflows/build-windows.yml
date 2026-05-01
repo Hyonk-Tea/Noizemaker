@@ -88,19 +88,22 @@ jobs:
       - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           tag="${{ github.ref_name }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
             gh release upload "$tag" \
               dist/noizemaker-windows.zip \
               dist/noizemaker-linux-x86_64.AppImage \
               dist/noizemaker-linux-x86_64.AppImage.sha256 \
+              --repo "$GH_REPO" \
               --clobber
           else
             gh release create "$tag" \
               dist/noizemaker-windows.zip \
               dist/noizemaker-linux-x86_64.AppImage \
               dist/noizemaker-linux-x86_64.AppImage.sha256 \
+              --repo "$GH_REPO" \
               --generate-notes \
               --title "$tag"
           fi
