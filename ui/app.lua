@@ -2,6 +2,7 @@ local format = require("core.format")
 local rebuild = require("core.rebuild")
 local rules = require("core.rules")
 local modcore = require("core.mods")
+local platform = require("core.platform")
 local theme = require("ui.theme")
 local widgets = require("ui.widgets")
 local tree = require("ui.tree")
@@ -128,94 +129,24 @@ local function write_config(path, game_root)
     return true
 end
 
-local function run_powershell(script)
-    local command = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' .. script:gsub('"', '\\"') .. '"'
-    local pipe = io.popen(command, "r")
-    if not pipe then
-        return nil
-    end
-    local output = pipe:read("*a")
-    pipe:close()
-    output = trim(output or "")
-    if output == "" then
-        return nil
-    end
-    return output
-end
-
 local function choose_folder(initial_path)
-    local script = {
-        "Add-Type -AssemblyName System.Windows.Forms",
-        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog",
-        "$dialog.Description = 'Select your Space Channel 5 Part 2 root directory'",
-    }
-    if initial_path and initial_path ~= "" then
-        script[#script + 1] = "$dialog.SelectedPath = '" .. initial_path:gsub("'", "''") .. "'"
-    end
-    script[#script + 1] = "$dialog.ShowNewFolderButton = $false"
-    script[#script + 1] = "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $dialog.SelectedPath }"
-    return run_powershell(table.concat(script, "; "))
+    return platform.choose_folder(initial_path)
 end
 
 local function choose_file(initial_dir)
-    local script = {
-        "Add-Type -AssemblyName System.Windows.Forms",
-        "$dialog = New-Object System.Windows.Forms.OpenFileDialog",
-        "$dialog.Title = 'Open DGSH rhythm file'",
-        "$dialog.Filter = 'DGSH binaries (*.bin)|*.bin|All files (*.*)|*.*'",
-        "$dialog.CheckFileExists = $true",
-        "$dialog.Multiselect = $false",
-    }
-    if initial_dir and initial_dir ~= "" then
-        script[#script + 1] = "$dialog.InitialDirectory = '" .. initial_dir:gsub("'", "''") .. "'"
-    end
-    script[#script + 1] = "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $dialog.FileName }"
-    return run_powershell(table.concat(script, "; "))
+    return platform.choose_open_file("Open DGSH rhythm file", "DGSH binaries (*.bin)|*.bin|All files (*.*)|*.*", initial_dir)
 end
 
 local function choose_zip_file(initial_dir)
-    local script = {
-        "Add-Type -AssemblyName System.Windows.Forms",
-        "$dialog = New-Object System.Windows.Forms.OpenFileDialog",
-        "$dialog.Title = 'Install Noizemaker Mod'",
-        "$dialog.Filter = 'Zip archives (*.zip)|*.zip|All files (*.*)|*.*'",
-        "$dialog.CheckFileExists = $true",
-        "$dialog.Multiselect = $false",
-    }
-    if initial_dir and initial_dir ~= "" then
-        script[#script + 1] = "$dialog.InitialDirectory = '" .. initial_dir:gsub("'", "''") .. "'"
-    end
-    script[#script + 1] = "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $dialog.FileName }"
-    return run_powershell(table.concat(script, "; "))
+    return platform.choose_open_file("Install Noizemaker Mod", "Zip archives (*.zip)|*.zip|All files (*.*)|*.*", initial_dir)
 end
 
 local function choose_save_file(initial_dir, suggested_name)
-    local script = {
-        "Add-Type -AssemblyName System.Windows.Forms",
-        "$dialog = New-Object System.Windows.Forms.SaveFileDialog",
-        "$dialog.Title = 'Patch Copy'",
-        "$dialog.Filter = 'DGSH binaries (*.bin)|*.bin|All files (*.*)|*.*'",
-        "$dialog.OverwritePrompt = $true",
-        "$dialog.AddExtension = $true",
-    }
-    if initial_dir and initial_dir ~= "" then
-        script[#script + 1] = "$dialog.InitialDirectory = '" .. initial_dir:gsub("'", "''") .. "'"
-    end
-    if suggested_name and suggested_name ~= "" then
-        script[#script + 1] = "$dialog.FileName = '" .. suggested_name:gsub("'", "''") .. "'"
-    end
-    script[#script + 1] = "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $dialog.FileName }"
-    return run_powershell(table.concat(script, "; "))
+    return platform.choose_save_file("Patch Copy", "DGSH binaries (*.bin)|*.bin|All files (*.*)|*.*", initial_dir, suggested_name)
 end
 
 local function prompt_text(title, prompt, default_value)
-    local script = {
-        "Add-Type -AssemblyName Microsoft.VisualBasic",
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
-        "$value = [Microsoft.VisualBasic.Interaction]::InputBox('" .. prompt:gsub("'", "''") .. "', '" .. title:gsub("'", "''") .. "', '" .. tostring(default_value or ""):gsub("'", "''") .. "')",
-        "if ($value -ne '') { Write-Output $value }",
-    }
-    return run_powershell(table.concat(script, "; "))
+    return platform.prompt_text(title, prompt, default_value)
 end
 
 local function valid_game_root(path)

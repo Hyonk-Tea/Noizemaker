@@ -1,20 +1,20 @@
 # Noizemaker
 
-Noizemaker is a Lua/LÖVE rewrite of the Space Channel 5 Part 2 rhythm editor and patcher.
+Noizemaker is a Lua/LOVE rewrite of the Space Channel 5 Part 2 rhythm editor and patcher.
 
 ## Running the app
 
-Ideally, download the .zip from the Releases tab on the right.
+Ideally, download the packaged `.zip` from the Releases page.
 
-Otherwise;
-
-From the repo root:
+If you want to run it from source instead, from the repo root:
 
 ```powershell
 love .
 ```
 
 On first launch, Noizemaker looks for `config.ini`. If `game_root` is missing or invalid, it will prompt you for your Space Channel 5 Part 2 install folder.
+
+On Linux, the runtime path now uses native shell tools instead of PowerShell for mod and file management. The current dialog layer expects either `zenity` or `kdialog`, and zip handling expects `unzip` or `tar`.
 
 ## Editing a sequence
 
@@ -110,5 +110,5 @@ Optional fields currently supported:
 
 ## Notes
 
-- This tool does not support MacOS. If you have it running, good for you.
-
+- Linux runtime support is now wired through platform-native tools, but the Windows dialog path still keeps a PowerShell fallback.
+- This tool does not support macOS. If you have it running there, you are on your own.

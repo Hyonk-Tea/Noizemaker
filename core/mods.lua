@@ -1,4 +1,5 @@
 local M = {}
+local platform = require("core.platform")
 
 local function trim(text)
     return (tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
@@ -65,91 +66,28 @@ local function write_all(path, data)
     return true
 end
 
-local function ps_quote(text)
-    return "'" .. tostring(text or ""):gsub("'", "''") .. "'"
-end
-
-local function run_powershell(script)
-    local command = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' .. script:gsub('"', '\\"') .. '"'
-    local pipe = io.popen(command, "r")
-    if not pipe then
-        return nil
-    end
-    local output = pipe:read("*a")
-    pipe:close()
-    return output or ""
-end
-
 local function directory_exists(path)
-    local output = trim(run_powershell("[Console]::Write((Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Container).ToString().ToLower())"))
-    return output == "true"
+    return platform.directory_exists(path)
 end
 
 local function ensure_dir(path)
-    local script = table.concat({
-        "$null = New-Item -ItemType Directory -Force -Path " .. ps_quote(path),
-        "[Console]::Write((Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Container).ToString().ToLower())",
-    }, "; ")
-    return trim(run_powershell(script)) == "true"
+    return platform.ensure_dir(path)
 end
 
 local function remove_dir(path)
-    local script = table.concat({
-        "if (Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Container) { Remove-Item -LiteralPath " .. ps_quote(path) .. " -Recurse -Force -ErrorAction SilentlyContinue }",
-        "[Console]::Write((Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Container).ToString().ToLower())",
-    }, "; ")
-    return trim(run_powershell(script)) ~= "true"
+    return platform.remove_dir(path)
 end
 
 local function remove_file(path)
-    local script = table.concat({
-        "if (Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Leaf) { Remove-Item -LiteralPath " .. ps_quote(path) .. " -Force -ErrorAction SilentlyContinue }",
-        "[Console]::Write((Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Leaf).ToString().ToLower())",
-    }, "; ")
-    return trim(run_powershell(script)) ~= "true"
+    return platform.remove_file(path)
 end
 
 local function list_directories(path)
-    local script = table.concat({
-        "$items = @()",
-        "if (Test-Path -LiteralPath " .. ps_quote(path) .. " -PathType Container) { $items = Get-ChildItem -LiteralPath " .. ps_quote(path) .. " -Directory -ErrorAction SilentlyContinue | Sort-Object Name }",
-        "foreach ($item in $items) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $item.Name }",
-    }, "; ")
-    local output = run_powershell(script)
-    local items = {}
-    for line in tostring(output):gmatch("[^\r\n]+") do
-        local value = trim(line)
-        if value ~= "" then
-            items[#items + 1] = value
-        end
-    end
-    return items
+    return platform.list_directories(path)
 end
 
 local function list_files_recursive(path)
-    local script = table.concat({
-        "$root = " .. ps_quote(path),
-        "$items = @()",
-        "if (Test-Path -LiteralPath $root -PathType Container) {",
-        "  $rootNorm = ([IO.Path]::GetFullPath($root).Replace('\\','/')).TrimEnd('/')",
-        "  $items = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName",
-        "  foreach ($item in $items) {",
-        "    $full = ([IO.Path]::GetFullPath($item.FullName).Replace('\\','/'))",
-        "    $rel = $full.Substring($rootNorm.Length).TrimStart('/')",
-        "    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
-        "    Write-Output $rel",
-        "  }",
-        "}",
-    }, "; ")
-    local output = run_powershell(script)
-    local items = {}
-    for line in tostring(output):gmatch("[^\r\n]+") do
-        local value = normalize_slashes(trim(line))
-        if value ~= "" then
-            items[#items + 1] = value
-        end
-    end
-    return items
+    return platform.list_files_recursive(path)
 end
 
 local function copy_file(src, dst)
@@ -335,23 +273,7 @@ local function detect_conflicts_for_mod(target_mod, installed_mods)
 end
 
 local function archive_entries(zip_path)
-    local script = table.concat({
-        "Add-Type -AssemblyName System.IO.Compression.FileSystem",
-        "$zip = [System.IO.Compression.ZipFile]::OpenRead(" .. ps_quote(zip_path) .. ")",
-        "try {",
-        "  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
-        "  foreach ($entry in $zip.Entries) { Write-Output $entry.FullName }",
-        "} finally { $zip.Dispose() }",
-    }, "; ")
-    local output = run_powershell(script)
-    local entries = {}
-    for line in tostring(output):gmatch("[^\r\n]+") do
-        local value = normalize_slashes(trim(line))
-        if value ~= "" then
-            entries[#entries + 1] = value
-        end
-    end
-    return entries
+    return platform.archive_entries(zip_path)
 end
 
 local function archive_root_prefix(entries)
@@ -400,13 +322,7 @@ local function archive_root_prefix(entries)
 end
 
 local function expand_archive(zip_path, destination)
-    local script = table.concat({
-        "if (Test-Path -LiteralPath " .. ps_quote(destination) .. " -PathType Container) { Remove-Item -LiteralPath " .. ps_quote(destination) .. " -Recurse -Force -ErrorAction SilentlyContinue }",
-        "$null = New-Item -ItemType Directory -Force -Path " .. ps_quote(destination),
-        "Expand-Archive -LiteralPath " .. ps_quote(zip_path) .. " -DestinationPath " .. ps_quote(destination) .. " -Force",
-        "[Console]::Write((Test-Path -LiteralPath " .. ps_quote(destination) .. " -PathType Container).ToString().ToLower())",
-    }, "; ")
-    return trim(run_powershell(script)) == "true"
+    return platform.extract_archive(zip_path, destination)
 end
 
 local function temp_path(base_dir, stem, ext)
@@ -502,16 +418,7 @@ end
 
 function M.ensure_environment(base_dir)
     local p = paths(base_dir)
-    local script = table.concat({
-        "$null = New-Item -ItemType Directory -Force -Path " .. ps_quote(p.mods_dir),
-        "$null = New-Item -ItemType Directory -Force -Path " .. ps_quote(p.backups_dir),
-        "$null = New-Item -ItemType Directory -Force -Path " .. ps_quote(p.backups_original_dir),
-        "$modsOk = Test-Path -LiteralPath " .. ps_quote(p.mods_dir) .. " -PathType Container",
-        "$backupsOk = Test-Path -LiteralPath " .. ps_quote(p.backups_dir) .. " -PathType Container",
-        "$origOk = Test-Path -LiteralPath " .. ps_quote(p.backups_original_dir) .. " -PathType Container",
-        "[Console]::Write((($modsOk -and $backupsOk -and $origOk).ToString()).ToLower())",
-    }, "; ")
-    return trim(run_powershell(script)) == "true"
+    return ensure_dir(p.mods_dir) and ensure_dir(p.backups_dir) and ensure_dir(p.backups_original_dir)
 end
 
 function M.list_installed_mods(base_dir)
