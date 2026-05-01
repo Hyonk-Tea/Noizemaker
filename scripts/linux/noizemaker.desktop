@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Noizemaker
+Comment=Space Channel 5 Part 2 rhythm editor and patcher
+Exec=noizemaker %U
+Icon=noizemaker
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+StartupWMClass=noizemaker

@@ -1,4 +1,4 @@
-name: Build Windows package
+name: Build packages
 
 on:
   push:
@@ -30,17 +30,78 @@ jobs:
           path: dist/noizemaker-windows.zip
           retention-days: 30
 
-      - name: Publish GitHub Release asset
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: powershell
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y love zip curl file squashfs-tools desktop-file-utils
+
+      - name: Make Linux build script executable
+        run: chmod +x ./scripts/build_linux_appimage.sh
+
+      - name: Show Linux LOVE runtime
+        run: |
+          command -v love
+          love --version
+          file "$(command -v love)"
+
+      - name: Build Noizemaker Linux AppImage
+        run: |
+          export LOVE_BIN="$(command -v love)"
+          ./scripts/build_linux_appimage.sh
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: noizemaker-linux
+          path: |
+            dist/noizemaker-linux-x86_64.AppImage
+            dist/noizemaker-linux-x86_64.AppImage.sha256
+          retention-days: 30
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - build-windows
+      - build-linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: noizemaker-windows
+          path: dist
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: noizemaker-linux
+          path: dist
+
+      - name: Publish GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $asset = "dist/noizemaker-windows.zip"
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $asset --clobber
-          } else {
-            gh release create $tag $asset --verify-tag --generate-notes --title $tag
-          }
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              dist/noizemaker-windows.zip \
+              dist/noizemaker-linux-x86_64.AppImage \
+              dist/noizemaker-linux-x86_64.AppImage.sha256 \
+              --clobber
+          else
+            gh release create "$tag" \
+              dist/noizemaker-windows.zip \
+              dist/noizemaker-linux-x86_64.AppImage \
+              dist/noizemaker-linux-x86_64.AppImage.sha256 \
+              --verify-tag \
+              --generate-notes \
+              --title "$tag"
+          fi

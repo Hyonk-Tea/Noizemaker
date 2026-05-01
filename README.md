@@ -6,6 +6,8 @@ Noizemaker is a Lua/LOVE rewrite of the Space Channel 5 Part 2 rhythm editor and
 
 Ideally, download the packaged `.zip` from the Releases page.
 
+Tagged releases now also publish a Linux AppImage alongside the Windows package.
+
 If you want to run it from source instead, from the repo root:
 
 ```powershell
@@ -13,8 +15,6 @@ love .
 ```
 
 On first launch, Noizemaker looks for `config.ini`. If `game_root` is missing or invalid, it will prompt you for your Space Channel 5 Part 2 install folder.
-
-On Linux, the runtime path now uses native shell tools instead of PowerShell for mod and file management. The current dialog layer expects either `zenity` or `kdialog`, and zip handling expects `unzip` or `tar`.
 
 ## Editing a sequence
 
@@ -75,7 +75,7 @@ backups/
     r11cap_e.bin
 ```
 
-That backup tree mirrors the game-root-relative file layout.
+That backup tree mirrors the game root relative file layout.
 
 ## Mod manifest
 
