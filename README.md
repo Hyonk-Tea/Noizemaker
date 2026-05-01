@@ -110,5 +110,4 @@ Optional fields currently supported:
 
 ## Notes
 
-- Linux runtime support is now wired through platform-native tools, but the Windows dialog path still keeps a PowerShell fallback.
 - This tool does not support macOS. If you have it running there, you are on your own.

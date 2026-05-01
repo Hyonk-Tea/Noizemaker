@@ -101,7 +101,6 @@ jobs:
               dist/noizemaker-windows.zip \
               dist/noizemaker-linux-x86_64.AppImage \
               dist/noizemaker-linux-x86_64.AppImage.sha256 \
-              --verify-tag \
               --generate-notes \
               --title "$tag"
           fi
