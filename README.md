@@ -16,6 +16,8 @@ love .
 
 On first launch, Noizemaker looks for `config.ini`. If `game_root` is missing or invalid, it will prompt you for your Space Channel 5 Part 2 install folder.
 
+On supported platforms, Noizemaker also registers the `noize:` URL scheme so GameBanana 1-click install links can reopen the app.
+
 ## Editing a sequence
 
 The normal flow is:
@@ -50,6 +52,7 @@ The `Mods` button opens the built-in mod manager. It can:
 
 - install `.zip` Noizemaker mods
 - accept drag-and-drop zip installs
+- open `noize:` GameBanana install links
 - enable and disable installed mods
 - uninstall mods
 - restore backed-up original files

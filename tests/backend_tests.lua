@@ -2,6 +2,8 @@ package.path = "./?.lua;./?/init.lua;" .. package.path
 
 local format = require("core.format")
 local mods = require("core.mods")
+local noize = require("core.noize")
+local platform = require("core.platform")
 local rebuild = require("core.rebuild")
 
 local function read_all(path)
@@ -64,6 +66,12 @@ end
 
 local function step(code, gap)
     return format.Step.new(code, gap)
+end
+
+local function write_all(path, data)
+    local fh = assert(io.open(path, "wb"))
+    fh:write(data)
+    fh:close()
 end
 
 local fixtures_dir = "./fixtures"
@@ -165,6 +173,45 @@ changed_files:
     assert_equal(manifest.version, "1.0.0", "manifest version parse")
     assert_equal(#manifest.changed_files, 2, "manifest changed_files count")
     assert_equal(manifest.changed_files[2], "subdir/r11cap_e.bin", "manifest changed_files path parse")
+end
+
+tests[#tests + 1] = function()
+    local parsed, err = noize.parse("noize:https://gamebanana.com/mmdl/1687442,Mod,672910")
+    assert_true(parsed ~= nil, err)
+    assert_equal(parsed.archive_url, "https://gamebanana.com/mmdl/1687442", "noize archive url parse")
+    assert_equal(parsed.item_type, "Mod", "noize item type parse")
+    assert_equal(parsed.item_id, 672910, "noize item id parse")
+    assert_equal(parsed.suggested_filename, "1687442.zip", "noize suggested filename from mmdl url")
+end
+
+tests[#tests + 1] = function()
+    local parsed, err = noize.parse("noize://https://files.gamebanana.com/mods/rhythm_rebels.zip")
+    assert_true(parsed ~= nil, err)
+    assert_equal(parsed.archive_url, "https://files.gamebanana.com/mods/rhythm_rebels.zip", "noize archive-only url parse")
+    assert_equal(parsed.item_type, nil, "noize archive-only item type")
+    assert_equal(parsed.item_id, nil, "noize archive-only item id")
+end
+
+tests[#tests + 1] = function()
+    local parsed, err = noize.parse("noize:not-a-url,Mod,123")
+    assert_true(parsed == nil, "invalid noize URI should fail")
+    assert_true(tostring(err):match("valid http/https archive URL") ~= nil, "invalid noize URI error text")
+end
+
+tests[#tests + 1] = function()
+    local root = "./.build/test_list_files_recursive"
+    assert_true(platform.remove_dir(root) or true, "cleanup should not fail")
+    assert_true(platform.ensure_dir(root), "test root dir create")
+    assert_true(platform.ensure_dir(root .. "/nested"), "nested dir create")
+    write_all(root .. "/alpha.txt", "a")
+    write_all(root .. "/nested/beta.txt", "b")
+
+    local files = platform.list_files_recursive(root)
+    assert_equal(#files, 2, "list_files_recursive should find 2 files")
+    assert_equal(files[1], "alpha.txt", "list_files_recursive first relative file")
+    assert_equal(files[2], "nested/beta.txt", "list_files_recursive nested relative file")
+
+    platform.remove_dir(root)
 end
 
 for i = 1, #tests do

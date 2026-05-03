@@ -2,8 +2,9 @@
 Type=Application
 Name=Noizemaker
 Comment=Space Channel 5 Part 2 rhythm editor and patcher
-Exec=noizemaker %U
+Exec=noizemaker %u
 Icon=noizemaker
 Terminal=false
+MimeType=x-scheme-handler/noize;
 Categories=AudioVideo;Audio;Utility;
 StartupWMClass=noizemaker

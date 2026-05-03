@@ -2,6 +2,7 @@ local format = require("core.format")
 local rebuild = require("core.rebuild")
 local rules = require("core.rules")
 local modcore = require("core.mods")
+local noize = require("core.noize")
 local platform = require("core.platform")
 local theme = require("ui.theme")
 local widgets = require("ui.widgets")
@@ -13,6 +14,10 @@ local App = {}
 App.__index = App
 
 local SNAP_MODES = { 1, 2, 6, 24 }
+local VIEW_TRANSITION_DURATION = 0.18
+local VIEW_TRANSITION_SLIDE = 28
+local MODAL_ANIM_DURATION = 0.14
+local MODAL_ANIM_OFFSET = 12
 
 local MOVE_BUTTONS = {
     { label = "UP", code = format.GAME_TO_INTERNAL.UP },
@@ -145,10 +150,6 @@ local function choose_save_file(initial_dir, suggested_name)
     return platform.choose_save_file("Patch Copy", "DGSH binaries (*.bin)|*.bin|All files (*.*)|*.*", initial_dir, suggested_name)
 end
 
-local function prompt_text(title, prompt, default_value)
-    return platform.prompt_text(title, prompt, default_value)
-end
-
 local function valid_game_root(path)
     if not path or path == "" then
         return false
@@ -218,6 +219,39 @@ local function step_cycle_index(code)
         end
     end
     return nil
+end
+
+local function clamp(value, min_value, max_value)
+    if value < min_value then
+        return min_value
+    end
+    if value > max_value then
+        return max_value
+    end
+    return value
+end
+
+local function ease_out_cubic(t)
+    t = clamp(t or 0, 0, 1)
+    local inv = 1 - t
+    return 1 - inv * inv * inv
+end
+
+local function has_base_family(entry)
+    return entry and entry.base and entry.base ~= ""
+end
+
+local function file_exists(path)
+    local fh = io.open(path or "", "rb")
+    if fh then
+        fh:close()
+        return true
+    end
+    return false
+end
+
+local function path_exists(path)
+    return file_exists(path) or platform.directory_exists(path or "")
 end
 
 local function first_step_fixed_message(start_delay)
@@ -305,12 +339,19 @@ function App.new()
         pending_insert = nil,
         inspector_hits = {},
         controls_hits = {},
+        modal_hits = {},
+        modal = nil,
+        modal_anim = nil,
         snap_index = 1,
+        launch_args = {},
+        view_transition = nil,
+        view_canvases = {},
     }, App)
 end
 
-function App:load()
+function App:load(args)
     theme.init()
+    self.launch_args = args or {}
     self:load_config()
     self:refresh_optional_assets()
     modcore.ensure_environment(self.mod_base_dir)
@@ -319,10 +360,27 @@ function App:load()
         self:prompt_for_game_root()
     end
     self:resize(love.graphics.getWidth(), love.graphics.getHeight())
+    self:ensure_noize_protocol_registration()
+    self:handle_launch_args(self.launch_args)
 end
 
-function App:update()
+function App:update(dt)
+    self:update_animations(dt or 0)
     self:update_hover_state()
+end
+
+function App:update_animations(dt)
+    if self.view_transition then
+        local transition = self.view_transition
+        transition.t = math.min(transition.duration, transition.t + dt)
+        if transition.t >= transition.duration then
+            self.view_transition = nil
+        end
+    end
+
+    if self.modal and self.modal_anim then
+        self.modal_anim.t = math.min(self.modal_anim.duration, self.modal_anim.t + dt)
+    end
 end
 
 function App:update_hover_state()
@@ -374,6 +432,51 @@ function App:prompt_for_game_root()
     end
 end
 
+function App:protocol_launch_target()
+    local executable = os.getenv("APPIMAGE")
+    if not executable or executable == "" then
+        executable = (arg and arg[0]) or nil
+    end
+    executable = normalize_slashes(executable or "")
+    if executable == "" or not file_exists(executable) then
+        return nil
+    end
+
+    local source
+    if love and love.filesystem and love.filesystem.getSource then
+        local raw_source = love.filesystem.getSource()
+        if raw_source and raw_source ~= "" then
+            source = normalize_slashes(raw_source)
+            if not source:match("^[A-Za-z]:[/\\]") and source:sub(1, 1) ~= "/" then
+                local base_dir = love.filesystem.getSourceBaseDirectory and love.filesystem.getSourceBaseDirectory() or ""
+                if base_dir ~= "" then
+                    source = normalize_slashes(join_path(base_dir, source))
+                end
+            end
+        end
+    end
+
+    local lower_exe = executable:lower()
+    if source and source ~= "" and path_exists(source) and source:lower() ~= lower_exe and (lower_exe:match("love%.exe$") or lower_exe:match("/love$")) then
+        return {
+            executable = executable,
+            source = source,
+        }
+    end
+
+    return {
+        executable = executable,
+    }
+end
+
+function App:ensure_noize_protocol_registration()
+    local launch = self:protocol_launch_target()
+    if not launch then
+        return false
+    end
+    return platform.register_url_protocol("noize", launch, "Noizemaker")
+end
+
 function App:build_work_from_entry(entry)
     return {
         steps = clone_steps(entry:as_step_list()),
@@ -413,6 +516,32 @@ function App:build_preview_entry(entry, work)
     end
 
     return preview
+end
+
+function App:entries_with_base(base_name)
+    local matches = {}
+    for i = 1, #self.entries do
+        local entry = self.entries[i]
+        if entry.base == base_name then
+            matches[#matches + 1] = entry
+        end
+    end
+    return matches
+end
+
+function App:selected_root_variants()
+    if not has_base_family(self.selected_entry) then
+        return {}
+    end
+
+    local variants = {}
+    local siblings = self:entries_with_base(self.selected_entry.base)
+    for i = 1, #siblings do
+        if siblings[i].name ~= self.selected_entry.name then
+            variants[#variants + 1] = siblings[i]
+        end
+    end
+    return variants
 end
 
 function App:work_equals_original(entry, work)
@@ -523,7 +652,7 @@ function App:open_file(path)
 
     local ok, parsed = pcall(format.parse, data)
     if not ok then
-        love.window.showMessageBox("Open failed", tostring(parsed), "error")
+        self:show_error("Open failed", tostring(parsed))
         self.status_text = "Open failed."
         return
     end
@@ -574,23 +703,339 @@ function App:selected_installed_mod()
 end
 
 function App:switch_view(view_name)
-    self.active_view = view_name or "editor"
+    local target = view_name or "editor"
+    if target == self.active_view and not self.view_transition then
+        return
+    end
+
+    local previous = self.active_view or "editor"
+    self.active_view = target
+    if previous ~= target then
+        self.view_transition = {
+            from = previous,
+            to = target,
+            t = 0,
+            duration = VIEW_TRANSITION_DURATION,
+        }
+    else
+        self.view_transition = nil
+    end
     self.pending_insert = nil
 end
 
 function App:show_error(title, message)
     self.status_text = message
-    love.window.showMessageBox(title or "Error", tostring(message), "error")
+    self:show_modal({
+        title = title or "Error",
+        message = tostring(message),
+        kind = "error",
+        buttons = {
+            { id = "ok", label = "OK", primary = true },
+        },
+    })
 end
 
 function App:show_info(title, message)
     self.status_text = message
-    love.window.showMessageBox(title or "Info", tostring(message), "info")
+    self:show_modal({
+        title = title or "Info",
+        message = tostring(message),
+        kind = "info",
+        buttons = {
+            { id = "ok", label = "OK", primary = true },
+        },
+    })
 end
 
-function App:confirm_action(title, message, ok_label)
-    local result = love.window.showMessageBox(title, message, { "Cancel", ok_label or "OK" }, "warning")
-    return result == 2 or result == (ok_label or "OK")
+function App:show_modal(spec)
+    self.modal = {
+        title = spec.title or "Notice",
+        message = tostring(spec.message or ""),
+        kind = spec.kind or "info",
+        buttons = spec.buttons or {
+            { id = "ok", label = "OK", primary = true },
+        },
+        on_result = spec.on_result,
+        dismiss_id = spec.dismiss_id,
+        input = spec.input and {
+            text = tostring(spec.input.text or ""),
+            placeholder = tostring(spec.input.placeholder or ""),
+            error = nil,
+            replace_on_type = spec.input.replace_on_type ~= false,
+        } or nil,
+    }
+    self.modal_anim = {
+        t = 0,
+        duration = MODAL_ANIM_DURATION,
+    }
+    self.modal_hits = {}
+end
+
+function App:dismiss_modal(result_id)
+    local modal = self.modal
+    if modal and modal.on_result then
+        local ok_to_close = modal.on_result(result_id, modal)
+        if ok_to_close == false then
+            return
+        end
+    end
+    self.modal = nil
+    self.modal_anim = nil
+    self.modal_hits = {}
+end
+
+function App:request_confirm(title, message, ok_label, on_confirm, on_cancel)
+    self:show_modal({
+        title = title or "Confirm",
+        message = tostring(message or ""),
+        kind = "warning",
+        dismiss_id = "cancel",
+        buttons = {
+            { id = "cancel", label = "Cancel" },
+            { id = "confirm", label = ok_label or "OK", primary = true },
+        },
+        on_result = function(result_id)
+            if result_id == "confirm" then
+                if on_confirm then
+                    on_confirm()
+                end
+            elseif on_cancel then
+                on_cancel()
+            end
+        end,
+    })
+end
+
+function App:request_integer(title, prompt, default_value, on_submit)
+    self:show_modal({
+        title = title or "Input",
+        message = tostring(prompt or ""),
+        kind = "info",
+        dismiss_id = "cancel",
+        input = {
+            text = tostring(default_value or ""),
+            replace_on_type = true,
+        },
+        buttons = {
+            { id = "cancel", label = "Cancel" },
+            { id = "confirm", label = "OK", primary = true },
+        },
+        on_result = function(result_id, modal)
+            if result_id ~= "confirm" then
+                return true
+            end
+
+            local text = modal and modal.input and modal.input.text or ""
+            local value = tonumber(text)
+            if value == nil then
+                if modal and modal.input then
+                    modal.input.error = "'" .. text .. "' is not a valid number."
+                end
+                return false
+            end
+
+            if on_submit then
+                on_submit(value)
+            end
+            return true
+        end,
+    })
+end
+
+function App:modal_color(kind)
+    if kind == "error" then
+        return theme.colors.danger, theme.colors.danger_soft
+    end
+    if kind == "warning" then
+        return theme.colors.amber, theme.colors.amber_soft
+    end
+    return theme.colors.accent, theme.colors.selection_soft
+end
+
+function App:modal_progress()
+    if not self.modal or not self.modal_anim then
+        return 1
+    end
+    return ease_out_cubic(self.modal_anim.t / math.max(self.modal_anim.duration, 0.001))
+end
+
+function App:draw_view_content(view_name)
+    if view_name == "mods" then
+        mods_tab.draw(self.mods_tab, self.layout.mods, self.installed_mods, {
+            game_root = self.game_root,
+            valid_game_root = valid_game_root(self.game_root),
+        })
+        return
+    end
+
+    tree.draw(self.tree, self.layout.left, self.selected_entry, self:entry_marker_map())
+    self:draw_controls()
+    self.timeline_render = timeline.draw(self.layout.timeline, self:current_preview_entry(), self.selected_step_index, {
+        validation = self.current_validation,
+        drag_index = self.drag and self.drag.index or nil,
+        insert_preview = self:insert_preview_info(),
+    })
+    self:draw_inspector()
+end
+
+function App:render_view_canvas(view_name)
+    local canvas = self.view_canvases and self.view_canvases[view_name]
+    if not canvas then
+        return nil
+    end
+
+    love.graphics.push("all")
+    love.graphics.setCanvas(canvas)
+    love.graphics.clear(0, 0, 0, 0)
+    love.graphics.origin()
+    self:draw_view_content(view_name)
+    love.graphics.setCanvas()
+    love.graphics.pop()
+    return canvas
+end
+
+function App:draw_view_transition()
+    local transition = self.view_transition
+    if not transition then
+        self:draw_view_content(self.active_view)
+        return
+    end
+
+    local from_canvas = self:render_view_canvas(transition.from)
+    local to_canvas = self:render_view_canvas(transition.to)
+    if not from_canvas or not to_canvas then
+        self:draw_view_content(self.active_view)
+        return
+    end
+
+    local progress = ease_out_cubic(transition.t / math.max(transition.duration, 0.001))
+    local sign = (transition.to == "mods") and 1 or -1
+
+    love.graphics.setColor(1, 1, 1, 1 - progress)
+    love.graphics.draw(from_canvas, -sign * VIEW_TRANSITION_SLIDE * progress, 0)
+
+    love.graphics.setColor(1, 1, 1, progress)
+    love.graphics.draw(to_canvas, sign * VIEW_TRANSITION_SLIDE * (1 - progress), 0)
+
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+function App:draw_modal()
+    if not self.modal then
+        return
+    end
+
+    local sw, sh = love.graphics.getWidth(), love.graphics.getHeight()
+    local progress = self:modal_progress()
+    love.graphics.setColor(0.02, 0.03, 0.05, 0.74 * progress)
+    love.graphics.rectangle("fill", 0, 0, sw, sh)
+
+    local accent, soft = self:modal_color(self.modal.kind)
+    local has_input = self.modal.input ~= nil
+    local panel = {
+        x = math.floor((sw - 560) * 0.5),
+        y = math.floor((sh - 300) * 0.5 + (1 - progress) * MODAL_ANIM_OFFSET),
+        w = 560,
+        h = has_input and 340 or 300,
+    }
+    if panel.w > sw - 40 then
+        panel.x = 20
+        panel.w = sw - 40
+    end
+    if panel.h > sh - 40 then
+        panel.y = 20
+        panel.h = sh - 40
+    end
+
+    widgets.draw_panel(panel, {
+        fill = theme.colors.panel_elevated,
+        border = accent,
+        radius = 14,
+    })
+
+    local title_bar = {
+        x = panel.x + 14,
+        y = panel.y + 14,
+        w = panel.w - 28,
+        h = 36,
+    }
+    widgets.draw_panel(title_bar, {
+        fill = soft,
+        border = accent,
+        radius = 10,
+    })
+    love.graphics.setFont(theme.font("small"))
+    love.graphics.setColor(accent[1], accent[2], accent[3], 1)
+    love.graphics.print(self.modal.title, title_bar.x + 12, title_bar.y + 10)
+
+    love.graphics.setFont(theme.font("body"))
+    love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+    love.graphics.printf(self.modal.message, panel.x + 18, panel.y + 64, panel.w - 36, "left")
+
+    local input_bottom = panel.y + panel.h - 70
+    if self.modal.input then
+        local input_rect = {
+            x = panel.x + 18,
+            y = panel.y + 170,
+            w = panel.w - 36,
+            h = 38,
+        }
+        widgets.draw_panel(input_rect, {
+            fill = theme.colors.panel,
+            border = accent,
+            radius = 10,
+        })
+
+        local input_text = self.modal.input.text
+        local placeholder = self.modal.input.placeholder
+        love.graphics.setFont(theme.font("body"))
+        if input_text == "" and placeholder ~= "" then
+            love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+            love.graphics.print(placeholder, input_rect.x + 12, input_rect.y + 10)
+        else
+            love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+            love.graphics.print(input_text, input_rect.x + 12, input_rect.y + 10)
+
+            local cursor_x = input_rect.x + 12 + love.graphics.getFont():getWidth(input_text)
+            love.graphics.setColor(accent[1], accent[2], accent[3], 1)
+            love.graphics.line(cursor_x + 2, input_rect.y + 8, cursor_x + 2, input_rect.y + input_rect.h - 8)
+        end
+
+        if self.modal.input.error then
+            love.graphics.setFont(theme.font("tiny"))
+            love.graphics.setColor(theme.colors.danger[1], theme.colors.danger[2], theme.colors.danger[3], 1)
+            love.graphics.printf(self.modal.input.error, input_rect.x, input_rect.y + input_rect.h + 8, input_rect.w, "left")
+        end
+        input_bottom = input_rect.y + input_rect.h + (self.modal.input.error and 34 or 18)
+    end
+
+    self.modal_hits = {}
+    local buttons = self.modal.buttons or {}
+    local button_w = 118
+    local button_h = 30
+    local gap = 10
+    local total_w = (#buttons * button_w) + math.max(0, (#buttons - 1) * gap)
+    local start_x = panel.x + panel.w - total_w - 18
+    local y = math.max(panel.y + panel.h - button_h - 18, input_bottom)
+    for i = 1, #buttons do
+        local button = buttons[i]
+        local rect = {
+            x = start_x + (i - 1) * (button_w + gap),
+            y = y,
+            w = button_w,
+            h = button_h,
+        }
+        widgets.draw_button(rect, button.label, {
+            font = theme.font("tiny"),
+            fill = button.primary and theme.colors.selection_soft or theme.colors.button,
+            hover_fill = button.primary and theme.colors.accent_soft or theme.colors.button_hover,
+            border = button.primary and theme.colors.selection or theme.colors.border,
+        })
+        self.modal_hits[#self.modal_hits + 1] = {
+            id = button.id,
+            rect = rect,
+        }
+    end
 end
 
 function App:install_mod_zip_path(path)
@@ -652,31 +1097,43 @@ function App:uninstall_selected_mod()
         self:show_info("Uninstall Mod", "Select a mod first.")
         return
     end
-    if not self:confirm_action("Uninstall Mod", "Uninstall '" .. (mod.name or mod.folder_name) .. "'?", "Uninstall") then
-        self.status_text = "Uninstall canceled."
-        return
-    end
-    local ok, err = modcore.uninstall_mod(mod.folder_name, self.game_root, self.mod_base_dir)
-    if not ok then
-        self:show_error("Uninstall Mod", err or "Failed to uninstall mod.")
-        return
-    end
-    self:refresh_installed_mods()
-    self.status_text = "Uninstalled mod: " .. (mod.name or mod.folder_name)
+    self:request_confirm(
+        "Uninstall Mod",
+        "Uninstall '" .. (mod.name or mod.folder_name) .. "'?",
+        "Uninstall",
+        function()
+            local ok, err = modcore.uninstall_mod(mod.folder_name, self.game_root, self.mod_base_dir)
+            if not ok then
+                self:show_error("Uninstall Mod", err or "Failed to uninstall mod.")
+                return
+            end
+            self:refresh_installed_mods()
+            self.status_text = "Uninstalled mod: " .. (mod.name or mod.folder_name)
+        end,
+        function()
+            self.status_text = "Uninstall canceled."
+        end
+    )
 end
 
 function App:restore_original_files()
-    if not self:confirm_action("Restore Original Files", "Restore all backed up original files into the game root?", "Restore") then
-        self.status_text = "Restore canceled."
-        return
-    end
-    local ok, err = modcore.restore_originals(self.game_root, self.mod_base_dir)
-    if not ok then
-        self:show_error("Restore Original Files", err or "Restore failed.")
-        return
-    end
-    self:refresh_installed_mods()
-    self.status_text = "Original files restored."
+    self:request_confirm(
+        "Restore Original Files",
+        "Restore all backed up original files into the game root?",
+        "Restore",
+        function()
+            local ok, err = modcore.restore_originals(self.game_root, self.mod_base_dir)
+            if not ok then
+                self:show_error("Restore Original Files", err or "Restore failed.")
+                return
+            end
+            self:refresh_installed_mods()
+            self.status_text = "Original files restored."
+        end,
+        function()
+            self.status_text = "Restore canceled."
+        end
+    )
 end
 
 function App:buttons()
@@ -692,6 +1149,29 @@ end
 
 function App:use_compact_move_grid(width)
     return (width or 0) < 860
+end
+
+function App:ensure_view_canvases(w, h)
+    if not love.graphics or not love.graphics.newCanvas then
+        self.view_canvases = {}
+        return
+    end
+
+    local current = self.view_canvases
+    if current.editor and current.editor:getWidth() == w and current.editor:getHeight() == h then
+        return
+    end
+
+    local ok_editor, editor_canvas = pcall(love.graphics.newCanvas, w, h)
+    local ok_mods, mods_canvas = pcall(love.graphics.newCanvas, w, h)
+    if ok_editor and ok_mods then
+        self.view_canvases = {
+            editor = editor_canvas,
+            mods = mods_canvas,
+        }
+    else
+        self.view_canvases = {}
+    end
 end
 
 function App:resize(w, h)
@@ -723,6 +1203,7 @@ function App:resize(w, h)
         w = w - 32,
         h = h - 84,
     }
+    self:ensure_view_canvases(w, h)
 end
 
 function App:draw_background()
@@ -844,7 +1325,14 @@ end
 
 function App:show_validation_errors(validation, title)
     if validation and not validation.ok then
-        love.window.showMessageBox(title or "Validation error", table.concat(validation.errors, "\n"), "warning")
+        self:show_modal({
+            title = title or "Validation error",
+            message = table.concat(validation.errors, "\n"),
+            kind = "warning",
+            buttons = {
+                { id = "ok", label = "OK", primary = true },
+            },
+        })
     end
 end
 
@@ -883,19 +1371,6 @@ function App:accept_candidate(candidate, new_selected_step, options)
     return true
 end
 
-function App:prompt_integer(title, prompt, default_value)
-    local text = prompt_text(title, prompt, tostring(default_value or ""))
-    if not text then
-        return nil
-    end
-    local value = tonumber(text)
-    if value == nil then
-        love.window.showMessageBox("Invalid number", "'" .. text .. "' is not a valid number.", "warning")
-        return nil
-    end
-    return value
-end
-
 function App:apply_current_entry()
     if not self.selected_entry or not self.current_work then
         return false
@@ -926,6 +1401,172 @@ function App:apply_current_entry()
     return true
 end
 
+function App:clone_root_to_variants()
+    if not self.selected_entry or not self.current_work then
+        return false
+    end
+    if not has_base_family(self.selected_entry) then
+        self.status_text = "Select an entry with related variants before cloning."
+        return false
+    end
+
+    local variants = self:selected_root_variants()
+    if #variants == 0 then
+        self.status_text = "This entry has no related variants to clone into."
+        return false
+    end
+
+    local source_validation = self:validate_work(self.selected_entry, self.current_work)
+    self.current_validation = source_validation
+    if not source_validation.ok then
+        self.status_text = source_validation.errors[1] or "Root entry is invalid."
+        self:show_validation_errors(source_validation, "Clone blocked")
+        return false
+    end
+
+    local cloned = snapshot_from_work(self.current_work)
+    local applied = {}
+    local blocked = {}
+
+    for i = 1, #variants do
+        local target = variants[i]
+        local candidate = {
+            steps = clone_steps(cloned.steps),
+            anim_indices = clone_list(cloned.anim_indices),
+            start_delay = cloned.start_delay,
+            timing = cloned.timing,
+        }
+        local validation = rules.validate_mod(target, candidate.steps, {
+            anim_indices = candidate.anim_indices,
+            start_delay = candidate.start_delay,
+            timing = candidate.timing,
+        })
+
+        if validation.ok then
+            local modified = not self:work_equals_original(target, candidate)
+            self.drafts[target.name] = {
+                steps = clone_steps(candidate.steps),
+                anim_indices = clone_list(candidate.anim_indices),
+                start_delay = candidate.start_delay,
+                timing = candidate.timing,
+                validation = validation,
+                modified = modified,
+            }
+            if modified then
+                self.mods[target.name] = snapshot_from_work(candidate)
+            else
+                self.mods[target.name] = nil
+            end
+            applied[#applied + 1] = target.name
+        else
+            blocked[#blocked + 1] = string.format("%s: %s", target.name, validation.errors[1] or "validation failed")
+        end
+    end
+
+    self:update_draft_from_current()
+
+    if #applied == 0 then
+        self.status_text = blocked[1] or "Clone to variants failed."
+        self:show_modal({
+            title = "Clone blocked",
+            message = table.concat(blocked, "\n"),
+            kind = "warning",
+            buttons = {
+                { id = "ok", label = "OK", primary = true },
+            },
+        })
+        return false
+    end
+
+    if #blocked > 0 then
+        self.status_text = string.format("Cloned to %d variants; %d blocked.", #applied, #blocked)
+        self:show_modal({
+            title = "Clone to variants",
+            message = table.concat(blocked, "\n"),
+            kind = "warning",
+            buttons = {
+                { id = "ok", label = "OK", primary = true },
+            },
+        })
+    else
+        self.status_text = string.format("Cloned %s into %d sibling entries.", self.selected_entry.name, #applied)
+    end
+    return true
+end
+
+function App:noize_install_message(spec)
+    local lines = {
+        "Install this mod from GameBanana?",
+        "",
+        "Archive: " .. (spec.suggested_filename or "(unknown)"),
+        "Host: " .. (spec.host or "(unknown)"),
+    }
+    if spec.item_type and spec.item_id then
+        lines[#lines + 1] = string.format("Item: %s #%d", spec.item_type, spec.item_id)
+    end
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Noizemaker will download the archive and install it into your local mods library."
+    return table.concat(lines, "\n")
+end
+
+function App:handle_noize_uri(uri)
+    local spec, err = noize.parse(uri)
+    if not spec then
+        self:show_error("Noize Install", err or "Invalid noize URI.")
+        return false
+    end
+
+    self:switch_view("mods")
+    self:request_confirm(
+        "Install Mod",
+        self:noize_install_message(spec),
+        "Install",
+        function()
+            local installed, install_err = modcore.install_remote_archive(spec.archive_url, self.mod_base_dir, spec.suggested_filename)
+            if not installed then
+                self:show_error("Install Mod", install_err or "Failed to install downloaded mod.")
+                return
+            end
+
+            self:refresh_installed_mods()
+            self.mods_tab.selected_name = installed.folder_name
+            self.active_view = "mods"
+            self.status_text = "Installed mod: " .. installed.name
+
+            if valid_game_root(self.game_root) then
+                self:request_confirm(
+                    "Enable Mod",
+                    "Enable '" .. installed.name .. "' now?",
+                    "Enable",
+                    function()
+                        local updated, enable_err = modcore.enable_mod(installed.folder_name, self.game_root, self.mod_base_dir)
+                        if not updated then
+                            self:show_error("Enable Mod", enable_err or "Failed to enable mod.")
+                            return
+                        end
+                        self:refresh_installed_mods()
+                        self.mods_tab.selected_name = installed.folder_name
+                        self.status_text = "Enabled mod: " .. installed.name
+                    end
+                )
+            end
+        end,
+        function()
+            self.status_text = "Noize install canceled."
+        end
+    )
+    return true
+end
+
+function App:handle_launch_args(args)
+    for _, value in ipairs(args or {}) do
+        if type(value) == "string" and noize.supports_uri(value) then
+            self:handle_noize_uri(value)
+            return
+        end
+    end
+end
+
 function App:patch_copy()
     if not self.current_buffer then
         self.status_text = "No file loaded."
@@ -939,7 +1580,7 @@ function App:patch_copy()
     local has_mods = next(self.mods) ~= nil
     if not has_mods then
         self.status_text = "No modifications to patch."
-        love.window.showMessageBox("Patch", "No modifications to patch yet. Use Apply first or edit the selected entry.", "info")
+        self:show_info("Patch", "No modifications to patch yet. Use Apply first or edit the selected entry.")
         return
     end
 
@@ -1048,17 +1689,28 @@ function App:arm_insert_move(move)
     local color = theme.colors.move
 
     if move.raw then
-        local raw = self:prompt_integer("Raw byte", "Enter raw byte value (0-255):", 0x41)
-        if raw == nil then
-            return
-        end
-        if raw < 0 or raw > 255 or raw % 1 ~= 0 then
-            love.window.showMessageBox("Invalid byte", "Raw byte must be an integer from 0 to 255.", "warning")
-            return
-        end
-        code = raw
-        preview_label = string.format("RAW %02X", raw)
-        color = theme.colors.raw
+        self:request_integer("Raw byte", "Enter raw byte value (0-255):", 0x41, function(raw)
+            if raw < 0 or raw > 255 or raw % 1 ~= 0 then
+                self:show_modal({
+                    title = "Invalid byte",
+                    message = "Raw byte must be an integer from 0 to 255.",
+                    kind = "warning",
+                    buttons = {
+                        { id = "ok", label = "OK", primary = true },
+                    },
+                })
+                return
+            end
+
+            self.pending_insert = {
+                code = raw,
+                preview_label = string.format("RAW %02X", raw),
+                source_label = move.label,
+                color = theme.colors.raw,
+            }
+            self.status_text = string.format("Placement mode: click the timeline to place %s.", self.pending_insert.preview_label)
+        end)
+        return
     elseif move.label == "CHU" or move.label == "HEY" or move.label == "HOLDCHU" or move.label == "HOLDHEY" then
         color = theme.colors.chu
     elseif move.label:match("^HOLD") then
@@ -1125,7 +1777,7 @@ function App:draw_controls()
     love.graphics.print("Place Move", rect.x + 18, rect.y + 14)
     love.graphics.setFont(theme.font("tiny"))
     love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
-    love.graphics.printf("Arm a move, then click the timeline to place it.", rect.x + 108, rect.y + 17, math.max(80, rect.w - 360), "left")
+    love.graphics.printf("Arm a move, then click the timeline to place it. Hold Shift to keep that move armed.", rect.x + 108, rect.y + 17, math.max(80, rect.w - 360), "left")
 
     local rows = self:move_button_rows()
     local metrics = self:move_grid_metrics()
@@ -1297,6 +1949,18 @@ function App:draw_inspector()
         line("Anim refs", table.concat(scan.indices, ", "))
     end
 
+    local variants = self:selected_root_variants()
+    if has_base_family(entry) and #variants > 0 then
+        local clone_rect = { x = rect.x + 18, y = info_y + 4, w = rect.w - 36, h = 26 }
+        widgets.draw_button(clone_rect, string.format("Clone %s into %d sibling%s", entry.name, #variants, #variants == 1 and "" or "s"), {
+            font = theme.font("tiny"),
+            fill = theme.colors.button,
+            border = theme.colors.border_soft,
+        })
+        self.inspector_hits[#self.inspector_hits + 1] = { kind = "clone_variants", rect = clone_rect }
+        info_y = info_y + 34
+    end
+
     local detail_y = info_y + 8
     local detail_rect = {
         x = rect.x + 14,
@@ -1414,27 +2078,14 @@ end
 function App:draw()
     self:draw_background()
     self:draw_topbar()
-    if self.active_view == "mods" then
-        mods_tab.draw(self.mods_tab, self.layout.mods, self.installed_mods, {
-            game_root = self.game_root,
-            valid_game_root = valid_game_root(self.game_root),
-        })
-    else
-        tree.draw(self.tree, self.layout.left, self.selected_entry, self:entry_marker_map())
-        self:draw_controls()
-        self.timeline_render = timeline.draw(self.layout.timeline, self:current_preview_entry(), self.selected_step_index, {
-            validation = self.current_validation,
-            drag_index = self.drag and self.drag.index or nil,
-            insert_preview = self:insert_preview_info(),
-        })
-        self:draw_inspector()
-    end
+    self:draw_view_transition()
 
     love.graphics.setFont(theme.font("tiny"))
     love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
     local status_x = self.active_view == "mods" and self.layout.mods.x or self.layout.timeline.x
     local status_y = self.active_view == "mods" and (self.layout.mods.y + self.layout.mods.h + 4) or (self.layout.timeline.y + self.layout.timeline.h + 4)
     love.graphics.print(self.status_text, status_x, status_y)
+    self:draw_modal()
 end
 
 function App:add_move(move)
@@ -1512,41 +2163,42 @@ function App:set_selected_raw_code()
         return
     end
     local current = self.current_work.steps[self.selected_step_index].code
-    local raw = self:prompt_integer("Raw byte", "Enter raw byte value (0-255):", current)
-    if raw == nil then
-        return
-    end
-    if raw < 0 or raw > 255 or raw % 1 ~= 0 then
-        love.window.showMessageBox("Invalid byte", "Raw byte must be an integer from 0 to 255.", "warning")
-        return
-    end
-    self:set_selected_code(raw)
+    self:request_integer("Raw byte", "Enter raw byte value (0-255):", current, function(raw)
+        if raw < 0 or raw > 255 or raw % 1 ~= 0 then
+            self:show_modal({
+                title = "Invalid byte",
+                message = "Raw byte must be an integer from 0 to 255.",
+                kind = "warning",
+                buttons = {
+                    { id = "ok", label = "OK", primary = true },
+                },
+            })
+            return
+        end
+        self:set_selected_code(raw)
+    end)
 end
 
 function App:edit_start_delay()
     if not self.current_work then
         return
     end
-    local value = self:prompt_integer("Start delay", "Enter start delay in ticks:", self.current_work.start_delay)
-    if value == nil then
-        return
-    end
-    local candidate = snapshot_from_work(self.current_work)
-    candidate.start_delay = value
-    self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated start delay." })
+    self:request_integer("Start delay", "Enter start delay in ticks:", self.current_work.start_delay, function(value)
+        local candidate = snapshot_from_work(self.current_work)
+        candidate.start_delay = value
+        self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated start delay." })
+    end)
 end
 
 function App:edit_timing()
     if not self.current_work then
         return
     end
-    local value = self:prompt_integer("Timing", "Enter timing in quarter-note units:", self.current_work.timing)
-    if value == nil then
-        return
-    end
-    local candidate = snapshot_from_work(self.current_work)
-    candidate.timing = value
-    self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated timing." })
+    self:request_integer("Timing", "Enter timing in quarter-note units:", self.current_work.timing, function(value)
+        local candidate = snapshot_from_work(self.current_work)
+        candidate.timing = value
+        self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated timing." })
+    end)
 end
 
 function App:edit_selected_gap()
@@ -1557,13 +2209,11 @@ function App:edit_selected_gap()
         return
     end
     local current_gap = self.current_work.steps[self.selected_step_index].gap
-    local value = self:prompt_integer("Gap after step", "Enter gap after this step in ticks:", current_gap)
-    if value == nil then
-        return
-    end
-    local candidate = snapshot_from_work(self.current_work)
-    candidate.steps[self.selected_step_index].gap = value
-    self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated step gap." })
+    self:request_integer("Gap after step", "Enter gap after this step in ticks:", current_gap, function(value)
+        local candidate = snapshot_from_work(self.current_work)
+        candidate.steps[self.selected_step_index].gap = value
+        self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated step gap." })
+    end)
 end
 
 function App:move_step_to_tick_in_candidate(candidate, target_tick)
@@ -1601,21 +2251,25 @@ function App:edit_selected_tick()
 
     local nodes = timeline.build_nodes(self:build_preview_entry(self.selected_entry, self.current_work))
     local current_tick = nodes[self.selected_step_index].tick
-    local value = self:prompt_integer("Step tick", "Enter the selected step tick position:", current_tick)
-    if value == nil then
-        return
-    end
-
-    local candidate = snapshot_from_work(self.current_work)
-    local ok, result = self:move_step_to_tick_in_candidate(candidate, self:display_to_raw_tick(value))
-    if not ok then
-        self.status_text = result
-        love.window.showMessageBox("Move blocked", result, "warning")
-        return
-    end
-    if self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated step tick." }) then
-        self.status_text = string.format("Updated step tick to %dt.", self:raw_to_display_tick(result))
-    end
+    self:request_integer("Step tick", "Enter the selected step tick position:", current_tick, function(value)
+        local candidate = snapshot_from_work(self.current_work)
+        local ok, result = self:move_step_to_tick_in_candidate(candidate, self:display_to_raw_tick(value))
+        if not ok then
+            self.status_text = result
+            self:show_modal({
+                title = "Move blocked",
+                message = result,
+                kind = "warning",
+                buttons = {
+                    { id = "ok", label = "OK", primary = true },
+                },
+            })
+            return
+        end
+        if self:accept_candidate(candidate, self.selected_step_index, { push_undo = true, success_message = "Updated step tick." }) then
+            self.status_text = string.format("Updated step tick to %dt.", self:raw_to_display_tick(result))
+        end
+    end)
 end
 
 function App:undo()
@@ -1708,6 +2362,22 @@ function App:draw_button_panel_message()
 end
 
 function App:mousepressed(x, y, button)
+    if self.modal then
+        if button == 1 then
+            for _, hit in ipairs(self.modal_hits) do
+                if widgets.point_in_rect(x, y, hit.rect) then
+                    self:dismiss_modal(hit.id)
+                    return
+                end
+            end
+        end
+        return
+    end
+
+    if self.view_transition then
+        return
+    end
+
     local buttons = self:buttons()
     if button == 1 then
         if widgets.point_in_rect(x, y, buttons.open) then
@@ -1797,6 +2467,8 @@ function App:mousepressed(x, y, button)
                     self:duplicate_selected_step()
                 elseif hit.kind == "delete" then
                     self:delete_selected_step()
+                elseif hit.kind == "clone_variants" then
+                    self:clone_root_to_variants()
                 end
                 return
             end
@@ -1807,8 +2479,13 @@ function App:mousepressed(x, y, button)
                 local display_tick = timeline.tick_from_x(self.timeline_render, x)
                 if display_tick then
                     if self:insert_step_at_tick(self.pending_insert.code, display_tick) then
+                        local keep_armed = love.keyboard.isDown("lshift", "rshift")
                         self.status_text = "Placed " .. self.pending_insert.preview_label .. "."
-                        self:clear_pending_insert()
+                        if keep_armed then
+                            self.status_text = self.status_text .. " Still armed."
+                        else
+                            self:clear_pending_insert()
+                        end
                     end
                 end
                 return
@@ -1823,18 +2500,27 @@ function App:mousepressed(x, y, button)
 end
 
 function App:mousereleased(_, _, button)
+    if self.view_transition then
+        return
+    end
     if self.active_view == "editor" and button == 1 then
         self:end_drag()
     end
 end
 
 function App:mousemoved(x)
+    if self.view_transition then
+        return
+    end
     if self.active_view == "editor" and self.drag then
         self:update_drag(x)
     end
 end
 
 function App:wheelmoved(_, y)
+    if self.view_transition then
+        return
+    end
     local mx, my = love.mouse.getPosition()
     if self.active_view == "mods" then
         mods_tab.wheelmoved(self.mods_tab, mx, my, y)
@@ -1846,6 +2532,52 @@ end
 function App:keypressed(key)
     local ctrl = love.keyboard.isDown("lctrl", "rctrl")
     local shift = love.keyboard.isDown("lshift", "rshift")
+
+    if self.modal then
+        if self.modal.input then
+            local input = self.modal.input
+            if key == "backspace" then
+                if input.replace_on_type then
+                    input.text = ""
+                    input.replace_on_type = false
+                else
+                    input.text = string.sub(input.text, 1, math.max(0, #input.text - 1))
+                end
+                input.error = nil
+                return
+            end
+            if ctrl and key == "v" and love.system and love.system.getClipboardText then
+                local clip = love.system.getClipboardText() or ""
+                if input.replace_on_type then
+                    input.text = clip
+                    input.replace_on_type = false
+                else
+                    input.text = input.text .. clip
+                end
+                input.error = nil
+                return
+            end
+        end
+        if key == "escape" then
+            self:dismiss_modal(self.modal.dismiss_id or "cancel")
+            return
+        end
+        if key == "return" or key == "kpenter" or key == "space" then
+            local buttons = self.modal.buttons or {}
+            local chosen = buttons[#buttons]
+            if chosen then
+                self:dismiss_modal(chosen.id)
+            else
+                self:dismiss_modal("ok")
+            end
+            return
+        end
+        return
+    end
+
+    if self.view_transition then
+        return
+    end
 
     if self.active_view == "mods" then
         if key == "escape" then
@@ -1883,6 +2615,21 @@ function App:keypressed(key)
     if key == "delete" or key == "backspace" then
         self:delete_selected_step()
     end
+end
+
+function App:textinput(text)
+    if self.view_transition or not self.modal or not self.modal.input then
+        return
+    end
+
+    local input = self.modal.input
+    if input.replace_on_type then
+        input.text = text
+        input.replace_on_type = false
+    else
+        input.text = input.text .. text
+    end
+    input.error = nil
 end
 
 function App:filedropped(file)

@@ -50,6 +50,12 @@ function love.keypressed(key, scancode, isrepeat)
     end
 end
 
+function love.textinput(text)
+    if app then
+        app:textinput(text)
+    end
+end
+
 function love.filedropped(file)
     if app then
         app:filedropped(file)

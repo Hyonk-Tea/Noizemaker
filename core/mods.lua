@@ -37,6 +37,12 @@ local function basename_no_ext(path)
     return basename(path):gsub("%.[^.]+$", "")
 end
 
+local function basename_from_url(url)
+    local path = tostring(url or ""):match("^https?://[^/%?#]+([^?#]*)") or ""
+    local name = path:match("([^/]+)$") or ""
+    return name
+end
+
 local function file_exists(path)
     local fh = io.open(path, "rb")
     if fh then
@@ -52,6 +58,16 @@ local function read_all(path)
         return nil
     end
     local data = fh:read("*a")
+    fh:close()
+    return data
+end
+
+local function read_head(path, count)
+    local fh = io.open(path, "rb")
+    if not fh then
+        return nil
+    end
+    local data = fh:read(count or 512)
     fh:close()
     return data
 end
@@ -549,6 +565,64 @@ function M.install_zip_bytes(filename, data, base_dir)
     local temp_zip = temp_path(p.mods_dir, basename_no_ext(filename or "dropped_mod"), ".zip")
     if not write_all(temp_zip, data or "") then
         return nil, "Could not store dropped zip file."
+    end
+
+    local installed, err = M.install_zip(temp_zip, base_dir)
+    remove_file(temp_zip)
+    return installed, err
+end
+
+local function looks_like_zip(data)
+    if not data or #data < 4 then
+        return false
+    end
+    local magic = data:sub(1, 4)
+    return magic == "PK\003\004" or magic == "PK\005\006" or magic == "PK\007\008"
+end
+
+local function looks_like_html(data)
+    local head = tostring(data or ""):lower()
+    return head:find("<!doctype", 1, true) ~= nil
+        or head:find("<html", 1, true) ~= nil
+        or head:find("<head", 1, true) ~= nil
+        or head:find("this site requires javascript", 1, true) ~= nil
+end
+
+function M.install_remote_archive(url, base_dir, suggested_filename)
+    local p = paths(base_dir)
+    if not M.ensure_environment(base_dir) then
+        return nil, "Could not create mods/backups directories."
+    end
+
+    local archive_url = trim(url)
+    if not archive_url:match("^https?://") then
+        return nil, "Only http/https archive URLs are supported."
+    end
+
+    local filename = trim(suggested_filename or "")
+    if filename == "" then
+        filename = basename_from_url(archive_url)
+    end
+    if filename == nil or filename == "" then
+        filename = "downloaded_mod.zip"
+    end
+    if not filename:lower():match("%.zip$") then
+        filename = filename .. ".zip"
+    end
+
+    local temp_zip = temp_path(p.mods_dir, basename_no_ext(filename), ".zip")
+    if not platform.download_file(archive_url, temp_zip) then
+        remove_file(temp_zip)
+        return nil, "Failed to download mod archive."
+    end
+
+    local head = read_head(temp_zip, 512)
+    if not looks_like_zip(head) then
+        remove_file(temp_zip)
+        if looks_like_html(head) and archive_url:lower():match("gamebanana%.com/") then
+            return nil, "GameBanana returned a web page instead of a zip archive. This link may require a browser-managed download token."
+        end
+        return nil, "Downloaded file was not a zip archive."
     end
 
     local installed, err = M.install_zip(temp_zip, base_dir)

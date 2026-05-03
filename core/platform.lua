@@ -87,6 +87,28 @@ local function run_powershell(script)
     return output
 end
 
+local function run_powershell_status(script)
+    local command = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "' .. script:gsub('"', '\\"') .. '"'
+    return run_status(command)
+end
+
+local function write_text_file(path, contents)
+    local fh = io.open(path, "w")
+    if not fh then
+        return false
+    end
+    fh:write(contents or "")
+    fh:close()
+    return true
+end
+
+local function desktop_exec_quote(text)
+    local value = tostring(text or "")
+    value = value:gsub("\\", "\\\\")
+    value = value:gsub('"', '\\"')
+    return '"' .. value .. '"'
+end
+
 local function choose_folder_powershell(initial_path)
     local script = {
         "Add-Type -AssemblyName System.Windows.Forms",
@@ -224,12 +246,31 @@ function M.list_directories(path)
 end
 
 function M.list_files_recursive(path)
-    local output
     if IS_WINDOWS then
-        output = read_command('dir /b /s /a-d ' .. cmd_quote(path) .. ' 2>NUL')
-    else
-        output = read_command('find ' .. sh_quote(path) .. " -type f 2>/dev/null")
+        local script = {
+            "$root = [System.IO.Path]::GetFullPath('" .. tostring(path):gsub("'", "''") .. "')",
+            "$rootNorm = $root.Replace('\\', '/').TrimEnd('/')",
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+            "Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object {",
+            "  $full = [System.IO.Path]::GetFullPath($_.FullName).Replace('\\', '/')",
+            "  if ($full.StartsWith($rootNorm, [System.StringComparison]::OrdinalIgnoreCase)) {",
+            "    $rel = $full.Substring($rootNorm.Length).TrimStart('/')",
+            "    if ($rel -ne '') { Write-Output $rel }",
+            "  }",
+            "}",
+        }
+        local output = run_powershell(table.concat(script, "; "))
+        if not output then
+            return {}
+        end
+        local items = split_lines(output)
+        table.sort(items, function(a, b)
+            return a:lower() < b:lower()
+        end)
+        return items
     end
+
+    local output = read_command('find ' .. sh_quote(path) .. " -type f 2>/dev/null")
     if not output then
         return {}
     end
@@ -253,6 +294,26 @@ function M.list_files_recursive(path)
 end
 
 function M.archive_entries(zip_path)
+    if IS_WINDOWS then
+        local script = {
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+            "$zip = [System.IO.Compression.ZipFile]::OpenRead('" .. tostring(zip_path):gsub("'", "''") .. "')",
+            "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; foreach ($entry in $zip.Entries) { if ($entry.FullName) { Write-Output $entry.FullName } } } finally { $zip.Dispose() }",
+        }
+        local output = run_powershell(table.concat(script, "; "))
+        if not output then
+            return {}
+        end
+        local entries = {}
+        for _, line in ipairs(split_lines(output)) do
+            local value = normalize_slashes(line):gsub("/+$", "")
+            if value ~= "" then
+                entries[#entries + 1] = value
+            end
+        end
+        return entries
+    end
+
     local output
     if M.command_exists("unzip") then
         output = read_command("unzip -Z1 " .. shell_quote(zip_path) .. " 2>/dev/null")
@@ -286,6 +347,14 @@ function M.extract_archive(zip_path, destination)
     end
     if not M.ensure_dir(destination) then
         return false
+    end
+
+    if IS_WINDOWS then
+        local script = {
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+            "[System.IO.Compression.ZipFile]::ExtractToDirectory('" .. tostring(zip_path):gsub("'", "''") .. "', '" .. tostring(destination):gsub("'", "''") .. "')",
+        }
+        return run_powershell_status(table.concat(script, "; "))
     end
 
     if M.command_exists("unzip") then
@@ -359,6 +428,115 @@ function M.prompt_text(title, prompt, default_value)
         return trim(read_command("kdialog --inputbox " .. sh_quote(prompt or "") .. " " .. sh_quote(default_value or "") .. " --title " .. sh_quote(title or "Input") .. " 2>/dev/null"))
     end
     return nil
+end
+
+function M.download_file(url, destination)
+    if not url or url == "" or not destination or destination == "" then
+        return false
+    end
+
+    local lower_url = tostring(url):lower()
+    local is_gamebanana = lower_url:match("^https?://[^/]*gamebanana%.com/") ~= nil
+    local curl_prefix = ""
+    if is_gamebanana then
+        curl_prefix = '-A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36" -e "https://gamebanana.com/" -H "Accept: application/octet-stream,*/*" '
+    end
+
+    if M.command_exists("curl") then
+        return run_status("curl -fsSL --max-redirs 5 " .. curl_prefix .. "-o " .. shell_quote(destination) .. " " .. shell_quote(url))
+    end
+
+    if IS_WINDOWS then
+        local script = { "$ProgressPreference = 'SilentlyContinue'" }
+        if is_gamebanana then
+            script[#script + 1] = "$headers = @{ 'Referer' = 'https://gamebanana.com/'; 'Accept' = 'application/octet-stream,*/*' }"
+            script[#script + 1] = "Invoke-WebRequest -Uri '" .. tostring(url):gsub("'", "''") .. "' -MaximumRedirection 5 -UserAgent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' -Headers $headers -OutFile '" .. tostring(destination):gsub("'", "''") .. "'"
+        else
+            script[#script + 1] = "Invoke-WebRequest -Uri '" .. tostring(url):gsub("'", "''") .. "' -MaximumRedirection 5 -OutFile '" .. tostring(destination):gsub("'", "''") .. "'"
+        end
+        return run_powershell_status(table.concat(script, "; "))
+    end
+
+    return false
+end
+
+function M.register_url_protocol(protocol, launch, app_name)
+    local scheme = trim(protocol)
+    if scheme == "" or type(launch) ~= "table" or trim(launch.executable) == "" then
+        return false
+    end
+
+    local display_name = trim(app_name)
+    if display_name == "" then
+        display_name = scheme
+    end
+
+    if IS_WINDOWS then
+        local command_value = cmd_quote(launch.executable)
+        if launch.source and trim(launch.source) ~= "" then
+            command_value = command_value .. " " .. cmd_quote(launch.source)
+        end
+        command_value = command_value .. ' "%1"'
+
+        local script = {
+            "$base = 'HKCU:\\Software\\Classes\\" .. scheme .. "'",
+            "New-Item -Path $base -Force | Out-Null",
+            "Set-Item -Path $base -Value 'URL:" .. tostring(display_name):gsub("'", "''") .. " Protocol'",
+            "New-ItemProperty -Path $base -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null",
+            "New-Item -Path ($base + '\\DefaultIcon') -Force | Out-Null",
+            "Set-Item -Path ($base + '\\DefaultIcon') -Value '" .. tostring(launch.executable):gsub("'", "''") .. ",0'",
+            "New-Item -Path ($base + '\\shell\\open\\command') -Force | Out-Null",
+            "Set-Item -Path ($base + '\\shell\\open\\command') -Value '" .. command_value:gsub("'", "''") .. "'",
+        }
+        return run_powershell_status(table.concat(script, "; "))
+    end
+
+    local home = os.getenv("HOME")
+    if not home or home == "" then
+        return false
+    end
+
+    local applications_dir = normalize_slashes(home) .. "/.local/share/applications"
+    if not M.ensure_dir(applications_dir) then
+        return false
+    end
+
+    local desktop_id = "noizemaker-noize.desktop"
+    local desktop_path = applications_dir .. "/" .. desktop_id
+    local exec_line = desktop_exec_quote(launch.executable)
+    if launch.source and trim(launch.source) ~= "" then
+        exec_line = exec_line .. " " .. desktop_exec_quote(launch.source)
+    end
+    exec_line = exec_line .. " %u"
+
+    local desktop = table.concat({
+        "[Desktop Entry]",
+        "Type=Application",
+        "Name=" .. display_name,
+        "Comment=Open Noizemaker 1-click mod install links",
+        "Exec=" .. exec_line,
+        "Icon=noizemaker",
+        "Terminal=false",
+        "NoDisplay=true",
+        "MimeType=x-scheme-handler/" .. scheme .. ";",
+        "Categories=Utility;",
+        "",
+    }, "\n")
+
+    if not write_text_file(desktop_path, desktop) then
+        return false
+    end
+
+    if M.command_exists("update-desktop-database") then
+        run_status("update-desktop-database " .. sh_quote(applications_dir) .. " >/dev/null 2>&1")
+    end
+    if M.command_exists("xdg-mime") then
+        run_status("xdg-mime default " .. sh_quote(desktop_id) .. " " .. sh_quote("x-scheme-handler/" .. scheme) .. " >/dev/null 2>&1")
+    elseif M.command_exists("gio") then
+        run_status("gio mime " .. sh_quote("x-scheme-handler/" .. scheme) .. " " .. sh_quote(desktop_id) .. " >/dev/null 2>&1")
+    end
+
+    return true
 end
 
 return M
