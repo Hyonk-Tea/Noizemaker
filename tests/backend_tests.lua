@@ -5,6 +5,7 @@ local mods = require("core.mods")
 local noize = require("core.noize")
 local platform = require("core.platform")
 local rebuild = require("core.rebuild")
+local rules = require("core.rules")
 
 local function read_all(path)
     local fh = assert(io.open(path, "rb"))
@@ -76,11 +77,17 @@ end
 
 local fixtures_dir = "./fixtures"
 local vanilla_path = fixtures_dir .. "/r11_sh_VANILLABACKUP.bin"
+local breaks_path = fixtures_dir .. "/r11_sh_breaks.bin"
 local simple_expected_path = fixtures_dir .. "/r11_sh_simple_edit_expected.bin"
 local ps007_expected_path = fixtures_dir .. "/r11_sh_ps007_expand_expected.bin"
+local r12_path = fixtures_dir .. "/R12_SH.BIN"
 
 local vanilla_buf = read_all(vanilla_path)
 local vanilla_entries = format.parse(vanilla_buf)
+local breaks_buf = read_all(breaks_path)
+local breaks_entries = format.parse(breaks_buf)
+local r12_buf = read_all(r12_path)
+local r12_entries = format.parse(r12_buf)
 
 local tests = {}
 
@@ -157,6 +164,48 @@ tests[#tests + 1] = function()
     local parsed = format.parse(rebuilt)
     local pd001 = find_entry(parsed, "pd001")
     assert_equal(pd001.timing, 20, "timing-only edit should rebuild with the new timing")
+end
+
+tests[#tests + 1] = function()
+    local ps007 = find_entry(vanilla_entries, "ps007")
+    local rescue = rules.scan_rescue_event_records(ps007)
+    assert_true(rescue ~= nil, "ps007 rescue scan should succeed")
+    assert_equal(rescue.record_count, 2, "ps007 rescue event count")
+    assert_equal(rescue.special_step_count, 2, "ps007 special-step count")
+    assert_equal(rescue.archetype, "per_special_event", "ps007 rescue archetype")
+    assert_equal(rescue.records[1].u16_1, 0x001B, "ps007 first rescue record field 1")
+    assert_equal(rescue.records[1].u16_3, 0x001E, "ps007 first rescue record field 3")
+    assert_equal(rescue.records[2].u16_3, 0x003C, "ps007 second rescue record field 3")
+end
+
+tests[#tests + 1] = function()
+    local pd005 = find_entry(vanilla_entries, "pd005")
+    assert_true(rules.detect_rescue_section(pd005) == nil, "pd005 triplet prefix should not be treated as expandable rescue ids")
+    assert_true(rules.scan_rescue_event_records(pd005) == nil, "pd005 rescue-event scan should stay disabled without rescue ids")
+end
+
+tests[#tests + 1] = function()
+    local ps002a = find_entry(r12_entries, "ps002a")
+    assert_true(rules.detect_rescue_section(ps002a) == nil, "ps002a triplet prefix should not be treated as expandable rescue ids")
+end
+
+tests[#tests + 1] = function()
+    local pd005 = find_entry(vanilla_entries, "pd005")
+    local pd005_breaks = find_entry(breaks_entries, "pd005")
+    local rebuilt = rebuild.apply_mods(vanilla_buf, vanilla_entries, {
+        pd005 = {
+            pd005_breaks:as_step_list(),
+        },
+    })
+    local reparsed = format.parse(rebuilt)
+    local rebuilt_pd005 = find_entry(reparsed, "pd005")
+    assert_true(rules.detect_rescue_section(rebuilt_pd005) == nil, "pd005 rebuild should keep triplet prefix out of rescue-id expansion")
+    assert_equal(#rebuilt_pd005.rest_body, #pd005.rest_body, "pd005 rebuild should preserve structured rest-body length")
+    assert_equal(
+        string.sub(rebuilt_pd005.rest_body, 1, 6),
+        string.sub(pd005.rest_body, 1, 6),
+        "pd005 rebuild should preserve the structured triplet prefix"
+    )
 end
 
 tests[#tests + 1] = function()

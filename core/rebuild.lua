@@ -1,4 +1,5 @@
 local format = require("core.format")
+local rules = require("core.rules")
 
 local M = {}
 
@@ -239,10 +240,12 @@ function M.normalize_shifted_start_delay_layout(buf)
 end
 
 function M.expand_local_id_list_if_needed(entry, rest_body, new_step_count)
-    local prefix_len, ids = format.local_id_list_info(entry)
-    if prefix_len == nil then
+    local rescue = rules.detect_rescue_section(entry)
+    if rescue == nil then
         return rest_body
     end
+    local prefix_len = rescue.prefix_len
+    local ids = rescue.ids
 
     local target_count = math.max(new_step_count - 1, 0)
     if target_count == #ids then
@@ -278,7 +281,7 @@ function M.rebuild_entry(entry, new_steps, options)
     local new_term = M.encode_start_delay(step_count, start_delay)
 
     local buf = entry.raw
-    if format.local_id_list_info(entry) == nil then
+    if rules.detect_rescue_section(entry) == nil then
         buf = write_u16(buf, 8, step_count)
     end
 

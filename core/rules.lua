@@ -30,6 +30,44 @@ local function is_integer(value)
     return type(value) == "number" and value % 1 == 0
 end
 
+local function count_special_steps(steps)
+    local count = 0
+    for i = 1, #(steps or {}) do
+        local code = steps[i]
+        if type(steps[i]) == "table" then
+            code = steps[i].code
+        end
+        if code == format.INV.CHU or code == format.INV.HEY or code == format.INV.HOLDCHU or code == format.INV.HOLDHEY then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function looks_like_structured_triplet_prefix(ids)
+    if not ids or #ids < 3 or (#ids % 3) ~= 0 then
+        return false
+    end
+
+    local triplets = #ids / 3
+    for i = 0, triplets - 1 do
+        local a = ids[i * 3 + 1]
+        local b = ids[i * 3 + 2]
+        local c = ids[i * 3 + 3]
+        if c ~= 0 then
+            return false
+        end
+        if a == nil or a < 0x0300 or a > 0x03FF then
+            return false
+        end
+        if b == nil or b <= 0 or b > 0x01FF then
+            return false
+        end
+    end
+
+    return true
+end
+
 function M.scan_animation_indices(entry)
     local rest_body = entry.rest_body or ""
     local blocks = {}
@@ -87,9 +125,71 @@ function M.detect_rescue_section(entry)
         return nil
     end
 
+    -- Some entries begin with one or more fixed 3-u16 metadata triplets
+    -- (for example 0x0322, local-id, 0x0000) before 0x4F07 records.
+    -- They satisfy the broad PS007 heuristic but are not safely expandable
+    -- by repeating "local IDs" to match step_count - 1.
+    if looks_like_structured_triplet_prefix(ids) then
+        return nil
+    end
+
     return {
         prefix_len = prefix_len,
         ids = copy_list(ids),
+    }
+end
+
+function M.scan_rescue_event_records(entry)
+    local rescue = M.detect_rescue_section(entry)
+    if rescue == nil then
+        return nil
+    end
+
+    local rest_body = entry.rest_body or ""
+    local records = {}
+    local pos = rescue.prefix_len
+
+    -- Rescue event records currently appear as 7 packed u16 values:
+    --   0x074F, then six additional u16 fields.
+    while pos + 13 < #rest_body do
+        if format.u16(rest_body, pos) ~= 0x074F then
+            break
+        end
+
+        records[#records + 1] = {
+            offset = pos,
+            opcode = 0x074F,
+            u16_1 = format.u16(rest_body, pos + 2),
+            u16_2 = format.u16(rest_body, pos + 4),
+            u16_3 = format.u16(rest_body, pos + 6),
+            u16_4 = format.u16(rest_body, pos + 8),
+            u16_5 = format.u16(rest_body, pos + 10),
+            u16_6 = format.u16(rest_body, pos + 12),
+        }
+        pos = pos + 14
+    end
+
+    local special_step_count = count_special_steps(entry.steps or {})
+    local archetype = "unknown"
+    if #records == 0 then
+        archetype = "id_prefix_only"
+    elseif special_step_count > 0 and #records == special_step_count then
+        archetype = "per_special_event"
+    elseif special_step_count > 0 and #records == special_step_count * 2 then
+        archetype = "double_event_per_special"
+    elseif #records == 1 then
+        archetype = "single_event_gate"
+    end
+
+    return {
+        prefix_len = rescue.prefix_len,
+        ids = copy_list(rescue.ids),
+        records = records,
+        record_count = #records,
+        special_step_count = special_step_count,
+        tail_offset = pos,
+        tail = slice(rest_body, pos, #rest_body),
+        archetype = archetype,
     }
 end
 
