@@ -36,6 +36,12 @@ for code, name in pairs(M.MOVES) do
 end
 
 M.TICK_CYCLE = { 6, 12, 18, 24, 48, 72 }
+M.SPECIAL_DISPLAY_NAMES = {
+    [0x83] = "Special UP",
+    [0x85] = "Special DOWN",
+    [0x84] = "Special RIGHT",
+    [0x86] = "Special LEFT",
+}
 
 local function normalize_buffer(buf)
     if type(buf) == "string" then
@@ -146,6 +152,10 @@ function M.is_raw_byte(code)
 end
 
 function M.step_display_name(code)
+    local special = M.SPECIAL_DISPLAY_NAMES[code]
+    if special ~= nil then
+        return special
+    end
     local name = M.INTERNAL_TO_GAME[code] or M.MOVES[code]
     if name ~= nil then
         return name

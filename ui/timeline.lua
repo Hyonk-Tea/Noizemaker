@@ -28,6 +28,16 @@ local function format_beats(timing)
     return string.format("%.2f", beats)
 end
 
+local function timeline_label_text(label)
+    if not label then
+        return ""
+    end
+    if label:match("^Special ") then
+        return label:gsub(" ", "\n", 1)
+    end
+    return label
+end
+
 local function node_rect(x, y, is_selected)
     local size = is_selected and 22 or 18
     return {
@@ -251,11 +261,13 @@ function M.draw(rect, entry, selected_step_index, options)
         local is_selected = selected_step_index == i
         local is_dragging = options.drag_index == i
         local rect_node = node_rect(x, y, is_selected)
+        local label_text = timeline_label_text(node.label)
+        local label_h = label_text:find("\n", 1, true) and 34 or 24
         local label_rect = {
             x = x - 34,
-            y = y + ((i % 2 == 0) and 20 or -48),
+            y = y + ((i % 2 == 0) and 20 or -(label_h + 24)),
             w = 68,
-            h = 24,
+            h = label_h,
         }
 
         local fill = node.color
@@ -296,7 +308,7 @@ function M.draw(rect, entry, selected_step_index, options)
         })
         love.graphics.setFont(theme.font("tiny"))
         love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
-        love.graphics.printf(node.label, label_rect.x, label_rect.y + 4, label_rect.w, "center")
+        love.graphics.printf(label_text, label_rect.x, label_rect.y + (label_h == 34 and 2 or 4), label_rect.w, "center")
 
         local hit = {
             index = i,

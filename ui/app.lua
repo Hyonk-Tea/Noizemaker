@@ -33,19 +33,27 @@ local MOVE_BUTTONS = {
     { label = "HOLDRIGHT", code = format.INV.HOLDRIGHT },
     { label = "HOLDCHU", code = format.INV.HOLDCHU },
     { label = "HOLDHEY", code = format.INV.HOLDHEY },
-    { label = "RAW", raw = true },
+    { label = "SPECIAL", special = true },
 }
 
 local MOVE_BUTTON_ROWS_WIDE = {
     { "UP", "DOWN", "LEFT", "RIGHT", "CHU", "HEY", "REST" },
-    { "HOLDUP", "HOLDDOWN", "HOLDLEFT", "HOLDRIGHT", "HOLDCHU", "HOLDHEY", "RAW" },
+    { "HOLDUP", "HOLDDOWN", "HOLDLEFT", "HOLDRIGHT", "HOLDCHU", "HOLDHEY", "SPECIAL" },
 }
 
 local MOVE_BUTTON_ROWS_COMPACT = {
     { "UP", "DOWN", "LEFT", "RIGHT" },
     { "CHU", "HEY", "HOLDCHU", "HOLDHEY" },
     { "HOLDUP", "HOLDDOWN", "HOLDLEFT", "HOLDRIGHT" },
-    { "REST", "RAW" },
+    { "REST", "SPECIAL" },
+}
+
+local SPECIAL_MOVE_CHOICES = {
+    { id = "raw", label = "RAW", code = nil, preview_label = nil, color = nil },
+    { id = "special_up", label = "Special UP", code = 0x83, preview_label = "Special UP", color = nil },
+    { id = "special_down", label = "Special DOWN", code = 0x85, preview_label = "Special DOWN", color = nil },
+    { id = "special_right", label = "Special RIGHT", code = 0x84, preview_label = "Special RIGHT", color = nil },
+    { id = "special_left", label = "Special LEFT", code = 0x86, preview_label = "Special LEFT", color = nil },
 }
 
 local MOVE_CYCLE = {
@@ -277,7 +285,7 @@ local function style_for_move_button(move, is_armed)
         font = theme.font("tiny"),
     }
 
-    if move.raw then
+    if move.raw or move.special then
         style.fill = theme.colors.amber_soft
         style.hover_fill = { 0.35, 0.24, 0.08, 1.0 }
         style.border = theme.colors.amber
@@ -1011,11 +1019,16 @@ function App:draw_modal()
 
     self.modal_hits = {}
     local buttons = self.modal.buttons or {}
-    local button_w = 118
     local button_h = 30
     local gap = 10
+    local max_footer_w = panel.w - 36
+    local button_w = 118
+    if #buttons > 0 then
+        button_w = math.floor((max_footer_w - math.max(0, (#buttons - 1) * gap)) / #buttons)
+        button_w = clamp(button_w, 84, 118)
+    end
     local total_w = (#buttons * button_w) + math.max(0, (#buttons - 1) * gap)
-    local start_x = panel.x + panel.w - total_w - 18
+    local start_x = panel.x + math.floor((panel.w - total_w) * 0.5)
     local y = math.max(panel.y + panel.h - button_h - 18, input_bottom)
     for i = 1, #buttons do
         local button = buttons[i]
@@ -1678,6 +1691,78 @@ function App:clear_pending_insert()
     self.pending_insert = nil
 end
 
+function App:set_pending_insert(code, preview_label, source_label, color)
+    self.pending_insert = {
+        code = code,
+        preview_label = preview_label,
+        source_label = source_label,
+        color = color or theme.colors.move,
+    }
+    self.status_text = string.format("Placement mode: click the timeline to place %s.", preview_label)
+end
+
+function App:prompt_special_move(move)
+    local lines = {
+        "Choose a special move.",
+        "",
+        "Press Escape to cancel.",
+    }
+    local buttons = {}
+    for i = 1, #SPECIAL_MOVE_CHOICES do
+        local choice = SPECIAL_MOVE_CHOICES[i]
+        buttons[#buttons + 1] = {
+            id = choice.id,
+            label = choice.label,
+            primary = choice.id == "raw",
+        }
+    end
+
+    self:show_modal({
+        title = "Special Move",
+        message = table.concat(lines, "\n"),
+        kind = "warning",
+        dismiss_id = "cancel",
+        buttons = buttons,
+        on_result = function(result_id)
+            if result_id == "cancel" then
+                return
+            end
+
+            local choice
+            for i = 1, #SPECIAL_MOVE_CHOICES do
+                if SPECIAL_MOVE_CHOICES[i].id == result_id then
+                    choice = SPECIAL_MOVE_CHOICES[i]
+                    break
+                end
+            end
+            if not choice then
+                return
+            end
+
+            if choice.id == "raw" then
+                self:request_integer("Raw byte", "Enter raw byte value (0-255):", 0x41, function(raw)
+                    if raw < 0 or raw > 255 or raw % 1 ~= 0 then
+                        self:show_modal({
+                            title = "Invalid byte",
+                            message = "Raw byte must be an integer from 0 to 255.",
+                            kind = "warning",
+                            buttons = {
+                                { id = "ok", label = "OK", primary = true },
+                            },
+                        })
+                        return
+                    end
+
+                    self:set_pending_insert(raw, string.format("RAW %02X", raw), move.label, theme.colors.raw)
+                end)
+                return
+            end
+
+            self:set_pending_insert(choice.code, choice.preview_label, move.label, theme.colors.raw)
+        end,
+    })
+end
+
 function App:arm_insert_move(move)
     if not self.selected_entry or not self.current_work then
         self.status_text = "Select an entry before placing a move."
@@ -1688,28 +1773,8 @@ function App:arm_insert_move(move)
     local preview_label = move.label
     local color = theme.colors.move
 
-    if move.raw then
-        self:request_integer("Raw byte", "Enter raw byte value (0-255):", 0x41, function(raw)
-            if raw < 0 or raw > 255 or raw % 1 ~= 0 then
-                self:show_modal({
-                    title = "Invalid byte",
-                    message = "Raw byte must be an integer from 0 to 255.",
-                    kind = "warning",
-                    buttons = {
-                        { id = "ok", label = "OK", primary = true },
-                    },
-                })
-                return
-            end
-
-            self.pending_insert = {
-                code = raw,
-                preview_label = string.format("RAW %02X", raw),
-                source_label = move.label,
-                color = theme.colors.raw,
-            }
-            self.status_text = string.format("Placement mode: click the timeline to place %s.", self.pending_insert.preview_label)
-        end)
+    if move.special then
+        self:prompt_special_move(move)
         return
     elseif move.label == "CHU" or move.label == "HEY" or move.label == "HOLDCHU" or move.label == "HOLDHEY" then
         color = theme.colors.chu
@@ -1717,13 +1782,7 @@ function App:arm_insert_move(move)
         color = theme.colors.accent
     end
 
-    self.pending_insert = {
-        code = code,
-        preview_label = preview_label,
-        source_label = move.label,
-        color = color,
-    }
-    self.status_text = string.format("Placement mode: click the timeline to place %s.", preview_label)
+    self:set_pending_insert(code, preview_label, move.label, color)
 end
 
 function App:insert_step_at_tick(code, target_tick)
@@ -2564,7 +2623,16 @@ function App:keypressed(key)
         end
         if key == "return" or key == "kpenter" or key == "space" then
             local buttons = self.modal.buttons or {}
-            local chosen = buttons[#buttons]
+            local chosen = nil
+            for i = 1, #buttons do
+                if buttons[i].primary then
+                    chosen = buttons[i]
+                    break
+                end
+            end
+            if not chosen then
+                chosen = buttons[#buttons]
+            end
             if chosen then
                 self:dismiss_modal(chosen.id)
             else
