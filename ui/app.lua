@@ -99,6 +99,54 @@ local function normalize_slashes(path)
     return (path or ""):gsub("\\", "/")
 end
 
+local function dirname(path)
+    return tostring(path or ""):match("^(.*)[/\\][^/\\]+$") or ""
+end
+
+local function filesystem_path_exists(path)
+    local fh = io.open(path or "", "rb")
+    if fh then
+        fh:close()
+        return true
+    end
+    return platform.directory_exists(path or "")
+end
+
+local function app_root_path()
+    local source = nil
+    if love and love.filesystem and love.filesystem.getSource then
+        local raw_source = love.filesystem.getSource()
+        if raw_source and raw_source ~= "" then
+            source = normalize_slashes(raw_source)
+            if not source:match("^[A-Za-z]:[/\\]") and source:sub(1, 1) ~= "/" then
+                local base_dir = love.filesystem.getSourceBaseDirectory and love.filesystem.getSourceBaseDirectory() or ""
+                if base_dir ~= "" then
+                    source = normalize_slashes(join_path(base_dir, source))
+                end
+            end
+        end
+    end
+
+    if source and source ~= "" then
+        if platform.directory_exists(source) then
+            return source
+        end
+        local source_dir = dirname(source)
+        if source_dir ~= "" and platform.directory_exists(source_dir) then
+            return normalize_slashes(source_dir)
+        end
+    end
+
+    if love and love.filesystem and love.filesystem.getSourceBaseDirectory then
+        local base_dir = normalize_slashes(love.filesystem.getSourceBaseDirectory() or "")
+        if base_dir ~= "" and platform.directory_exists(base_dir) then
+            return base_dir
+        end
+    end
+
+    return normalize_slashes(".")
+end
+
 local function parse_ini(path)
     local fh = io.open(path, "r")
     if not fh then
@@ -131,13 +179,17 @@ local function parse_ini(path)
     return data
 end
 
-local function write_config(path, game_root)
+local function write_config(path, game_root, noize_prompt_preference)
     local fh = io.open(path, "w")
     if not fh then
         return false
     end
-    fh:write("[paths]\n")
-    fh:write("game_root = ", normalize_slashes(game_root), "\n")
+    if game_root and game_root ~= "" then
+        fh:write("[paths]\n")
+        fh:write("game_root = ", normalize_slashes(game_root), "\n\n")
+    end
+    fh:write("[noize]\n")
+    fh:write("prompt = ", trim(noize_prompt_preference or "ask"), "\n")
     fh:close()
     return true
 end
@@ -262,6 +314,16 @@ local function path_exists(path)
     return file_exists(path) or platform.directory_exists(path or "")
 end
 
+local function first_existing_path(paths)
+    for i = 1, #paths do
+        local candidate = normalize_slashes(paths[i] or "")
+        if candidate ~= "" and file_exists(candidate) then
+            return candidate
+        end
+    end
+    return nil
+end
+
 local function first_step_fixed_message(start_delay)
     if (start_delay or 0) > 0 then
         return "The first step is anchored at Start delay on the timeline. Change Start delay to move it."
@@ -310,6 +372,7 @@ local function style_for_move_button(move, is_armed)
 end
 
 function App.new()
+    local root = app_root_path()
     return setmetatable({
         tree = tree.new_state(),
         mods_tab = mods_tab.new_state(),
@@ -317,11 +380,12 @@ function App.new()
         hovered_button = nil,
         status_text = "Ready.",
         active_view = "editor",
-        config_path = "config.ini",
-        mod_base_dir = ".",
+        app_root = root,
+        config_path = join_path(root, "config.ini"),
+        mod_base_dir = root,
         reports_paths = {
-            "reports.ini",
-            "legacy_python/reports.ini",
+            join_path(root, "reports.ini"),
+            join_path(root, "legacy_python/reports.ini"),
         },
         current_buffer = nil,
         entries = {},
@@ -333,7 +397,7 @@ function App.new()
         current_dirty = false,
         current_file_path = nil,
         current_file_name = "(no file)",
-        current_file_dir = ".",
+        current_file_dir = root,
         current_patch_path = nil,
         game_root = nil,
         title_font_renderer = nil,
@@ -354,6 +418,9 @@ function App.new()
         launch_args = {},
         view_transition = nil,
         view_canvases = {},
+        noize_protocol_prompt_preference = "ask",
+        noize_protocol_prompt_shown = false,
+        noize_protocol_registration_attempted = false,
     }, App)
 end
 
@@ -368,7 +435,6 @@ function App:load(args)
         self:prompt_for_game_root()
     end
     self:resize(love.graphics.getWidth(), love.graphics.getHeight())
-    self:ensure_noize_protocol_registration()
     self:handle_launch_args(self.launch_args)
 end
 
@@ -413,12 +479,13 @@ function App:load_config()
     if cfg and cfg.paths and cfg.paths.game_root then
         self.game_root = normalize_slashes(cfg.paths.game_root)
     end
+    if cfg and cfg.noize and cfg.noize.prompt and cfg.noize.prompt ~= "" then
+        self.noize_protocol_prompt_preference = trim(cfg.noize.prompt):lower()
+    end
 end
 
 function App:save_config()
-    if self.game_root and self.game_root ~= "" then
-        write_config(self.config_path, self.game_root)
-    end
+    write_config(self.config_path, self.game_root, self.noize_protocol_prompt_preference)
 end
 
 function App:refresh_optional_assets()
@@ -441,31 +508,47 @@ function App:prompt_for_game_root()
 end
 
 function App:protocol_launch_target()
-    local executable = os.getenv("APPIMAGE")
+    local source = self.app_root
+
+    local executable
+    if love and love.filesystem and love.filesystem.getExecutablePath then
+        local raw_executable = love.filesystem.getExecutablePath()
+        if raw_executable and raw_executable ~= "" then
+            executable = raw_executable
+        end
+    end
+    if not executable or executable == "" then
+        executable = os.getenv("APPIMAGE")
+    end
     if not executable or executable == "" then
         executable = (arg and arg[0]) or nil
     end
     executable = normalize_slashes(executable or "")
+
     if executable == "" or not file_exists(executable) then
-        return nil
+        local fallback = platform.find_command_path("love")
+        if not fallback and package.config:sub(1, 1) == "\\" then
+            fallback = first_existing_path({
+                "C:/Program Files/LOVE/love.exe",
+                "C:/Program Files (x86)/LOVE/love.exe",
+            })
+        end
+        executable = fallback or ""
     end
 
-    local source
-    if love and love.filesystem and love.filesystem.getSource then
-        local raw_source = love.filesystem.getSource()
-        if raw_source and raw_source ~= "" then
-            source = normalize_slashes(raw_source)
-            if not source:match("^[A-Za-z]:[/\\]") and source:sub(1, 1) ~= "/" then
-                local base_dir = love.filesystem.getSourceBaseDirectory and love.filesystem.getSourceBaseDirectory() or ""
-                if base_dir ~= "" then
-                    source = normalize_slashes(join_path(base_dir, source))
-                end
-            end
-        end
+    if executable == "" then
+        return nil, "Noizemaker could not find a launchable executable for noize:// registration."
+    end
+    if not file_exists(executable) then
+        return nil, "Noizemaker resolved a launch command, but the executable path does not exist: " .. executable
+    end
+
+    if source and source ~= "" and not filesystem_path_exists(source) then
+        source = nil
     end
 
     local lower_exe = executable:lower()
-    if source and source ~= "" and path_exists(source) and source:lower() ~= lower_exe and (lower_exe:match("love%.exe$") or lower_exe:match("/love$")) then
+    if source and source ~= "" and filesystem_path_exists(source) and source:lower() ~= lower_exe and (lower_exe:match("love%.exe$") or lower_exe:match("/love$")) then
         return {
             executable = executable,
             source = source,
@@ -478,11 +561,26 @@ function App:protocol_launch_target()
 end
 
 function App:ensure_noize_protocol_registration()
-    local launch = self:protocol_launch_target()
+    local launch, err = self:protocol_launch_target()
     if not launch then
-        return false
+        return false, err or "Noizemaker could not determine how to relaunch itself."
     end
-    return platform.register_url_protocol("noize", launch, "Noizemaker")
+    local ok = platform.register_url_protocol("noize", launch, "Noizemaker")
+    if not ok then
+        return false, "Noizemaker could not write the noize:// protocol association."
+    end
+    return true
+end
+
+function App:ensure_noize_protocol_registration_once()
+    if self.noize_protocol_registration_attempted then
+        return true
+    end
+    local ok, err = self:ensure_noize_protocol_registration()
+    if ok then
+        self.noize_protocol_registration_attempted = true
+    end
+    return ok, err
 end
 
 function App:build_work_from_entry(entry)
@@ -731,6 +829,54 @@ function App:switch_view(view_name)
     self.pending_insert = nil
 end
 
+function App:prompt_noize_protocol_registration()
+    if self.noize_protocol_prompt_preference == "never" or self.noize_protocol_prompt_preference == "registered" then
+        self:switch_view("mods")
+        return
+    end
+
+    if self.noize_protocol_prompt_shown then
+        self:switch_view("mods")
+        return
+    end
+
+    self.noize_protocol_prompt_shown = true
+    self:show_modal({
+        title = "Register `noize://` links for GameBanana One-Click support?",
+        message = table.concat({
+            "Noizemaker can register the noize:// link so GameBanana one-click installs open directly in the app.",
+            "",
+            "Register it now?",
+        }, "\n"),
+        kind = "info",
+        dismiss_id = "later",
+        buttons = {
+            { id = "later", label = "Ask Later" },
+            { id = "never", label = "Never" },
+            { id = "register", label = "Register Now", primary = true },
+        },
+        on_result = function(result_id)
+            if result_id == "register" then
+                local ok, err = self:ensure_noize_protocol_registration_once()
+                if ok then
+                    self.noize_protocol_prompt_preference = "registered"
+                    self:save_config()
+                    self.status_text = "Registered noize:// links."
+                else
+                    local details = err or "Noizemaker could not register the noize:// link on this system."
+                    self.status_text = details
+                    self:show_error("Register noize://", details)
+                end
+            elseif result_id == "never" then
+                self.noize_protocol_prompt_preference = "never"
+                self:save_config()
+                self.status_text = "Noize link registration prompt disabled."
+            end
+            self:switch_view("mods")
+        end,
+    })
+end
+
 function App:show_error(title, message)
     self.status_text = message
     self:show_modal({
@@ -787,9 +933,11 @@ function App:dismiss_modal(result_id)
             return
         end
     end
-    self.modal = nil
-    self.modal_anim = nil
-    self.modal_hits = {}
+    if self.modal == modal then
+        self.modal = nil
+        self.modal_anim = nil
+        self.modal_hits = {}
+    end
 end
 
 function App:request_confirm(title, message, ok_label, on_confirm, on_cancel)
@@ -2456,7 +2604,11 @@ function App:mousepressed(x, y, button)
             self:prompt_for_game_root()
             return
         elseif widgets.point_in_rect(x, y, buttons.mods) then
-            self:switch_view(self.active_view == "mods" and "editor" or "mods")
+            if self.active_view == "mods" then
+                self:switch_view("editor")
+            else
+                self:prompt_noize_protocol_registration()
+            end
             return
         end
     end

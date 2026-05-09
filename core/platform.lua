@@ -11,6 +11,12 @@ local function normalize_slashes(path)
     return normalized:gsub("/+", "/")
 end
 
+local function native_windows_path(path)
+    local value = tostring(path or "")
+    value = value:gsub("/", "\\")
+    return value
+end
+
 local function command_ok(result)
     if result == true then
         return true
@@ -102,6 +108,13 @@ local function write_text_file(path, contents)
     return true
 end
 
+local function reg_escape(text)
+    local value = tostring(text or "")
+    value = value:gsub("\\", "\\\\")
+    value = value:gsub('"', '\\"')
+    return value
+end
+
 local function desktop_exec_quote(text)
     local value = tostring(text or "")
     value = value:gsub("\\", "\\\\")
@@ -173,6 +186,44 @@ function M.command_exists(name)
         return run_status("where " .. tostring(name) .. " >NUL 2>NUL")
     end
     return run_status("command -v " .. sh_quote(name) .. " >/dev/null 2>&1")
+end
+
+function M.find_command_path(name)
+    local command_name = trim(name)
+    if command_name == "" then
+        return nil
+    end
+    local output
+    if IS_WINDOWS then
+        output = read_command("where " .. command_name .. " 2>NUL")
+    else
+        output = read_command("command -v " .. sh_quote(command_name) .. " 2>/dev/null")
+    end
+    if not output then
+        return nil
+    end
+    local lines = split_lines(output)
+    if #lines == 0 then
+        return nil
+    end
+    return normalize_slashes(lines[1])
+end
+
+function M.notify_association_changed()
+    if not IS_WINDOWS then
+        return true
+    end
+    local script = table.concat({
+        "Add-Type @\"",
+        "using System;",
+        "using System.Runtime.InteropServices;",
+        "public static class NoizemakerAssocNotify {",
+        "    [DllImport(\"shell32.dll\")] public static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);",
+        "}",
+        "\"@",
+        "[NoizemakerAssocNotify]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)",
+    }, "; ")
+    return run_powershell_status(script)
 end
 
 function M.is_windows()
@@ -472,23 +523,59 @@ function M.register_url_protocol(protocol, launch, app_name)
     end
 
     if IS_WINDOWS then
-        local command_value = cmd_quote(launch.executable)
-        if launch.source and trim(launch.source) ~= "" then
-            command_value = command_value .. " " .. cmd_quote(launch.source)
+        local executable = native_windows_path(launch.executable)
+        local source = launch.source and native_windows_path(launch.source) or nil
+        local command_value = cmd_quote(executable)
+        if source and trim(source) ~= "" then
+            command_value = command_value .. " " .. cmd_quote(source)
         end
         command_value = command_value .. ' "%1"'
+        local base_key = "HKEY_CURRENT_USER\\Software\\Classes\\" .. scheme
+        local icon_value = executable .. ",0"
+        local reg_path = os.tmpname()
+        if not reg_path or reg_path == "" then
+            reg_path = ".\\noize_protocol.reg"
+        end
+        reg_path = normalize_slashes(reg_path)
+        if not reg_path:lower():match("%.reg$") then
+            reg_path = reg_path .. ".reg"
+        end
 
-        local script = {
-            "$base = 'HKCU:\\Software\\Classes\\" .. scheme .. "'",
-            "New-Item -Path $base -Force | Out-Null",
-            "Set-Item -Path $base -Value 'URL:" .. tostring(display_name):gsub("'", "''") .. " Protocol'",
-            "New-ItemProperty -Path $base -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null",
-            "New-Item -Path ($base + '\\DefaultIcon') -Force | Out-Null",
-            "Set-Item -Path ($base + '\\DefaultIcon') -Value '" .. tostring(launch.executable):gsub("'", "''") .. ",0'",
-            "New-Item -Path ($base + '\\shell\\open\\command') -Force | Out-Null",
-            "Set-Item -Path ($base + '\\shell\\open\\command') -Value '" .. command_value:gsub("'", "''") .. "'",
-        }
-        return run_powershell_status(table.concat(script, "; "))
+        local reg_body = table.concat({
+            "Windows Registry Editor Version 5.00",
+            "",
+            "[" .. base_key .. "]",
+            '@="' .. reg_escape("URL:" .. display_name .. " Protocol") .. '"',
+            '"URL Protocol"=""',
+            "",
+            "[" .. base_key .. "\\DefaultIcon]",
+            '@="' .. reg_escape(icon_value) .. '"',
+            "",
+            "[" .. base_key .. "\\shell\\open\\command]",
+            '@="' .. reg_escape(command_value) .. '"',
+            "",
+        }, "\r\n")
+
+        if not write_text_file(reg_path, reg_body) then
+            return false
+        end
+
+        local imported = run_status("reg import " .. cmd_quote(reg_path))
+        M.remove_file(reg_path)
+        if not imported then
+            return false
+        end
+
+        local root_key = "HKCU\\Software\\Classes\\" .. scheme
+        local verified = run_status("reg query " .. cmd_quote(root_key) .. " /v " .. cmd_quote("URL Protocol"))
+            and run_status("reg query " .. cmd_quote(root_key .. "\\DefaultIcon") .. " /ve")
+            and run_status("reg query " .. cmd_quote(root_key .. "\\shell\\open\\command") .. " /ve")
+
+        if verified then
+            M.notify_association_changed()
+        end
+
+        return verified
     end
 
     local home = os.getenv("HOME")
