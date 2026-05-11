@@ -1,6 +1,6 @@
 # Noizemaker
 
-Noizemaker is a Lua/LOVE rewrite of the Space Channel 5 Part 2 rhythm editor and patcher.
+Noizemaker is a Space Channel 5 Part 2 rhythm editor and patcher.
 
 ## Running the app
 
