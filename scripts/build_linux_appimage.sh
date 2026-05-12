@@ -65,7 +65,7 @@ main() {
 
     (
         cd "$REPO_ROOT"
-        zip -qr "$GAME_LOVE" main.lua core ui README.md
+        zip -qr "$GAME_LOVE" conf.lua main.lua core ui assets README.md
     )
 
     cp "$GAME_LOVE" "$APPDIR/usr/share/noizemaker/noizemaker.love"

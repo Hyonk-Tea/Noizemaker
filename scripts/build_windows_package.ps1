@@ -8,11 +8,13 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $buildRoot = Join-Path $repoRoot ".build\windows"
 $downloadZip = Join-Path $buildRoot "love-win64.zip"
+$rceditExe = Join-Path $buildRoot "rcedit-x64.exe"
 $gameZip = Join-Path $buildRoot "noizemaker.zip"
 $gameLove = Join-Path $buildRoot "noizemaker.love"
 $outputRoot = Join-Path $repoRoot $OutputDir
 $packageRoot = Join-Path $outputRoot "noizemaker-windows"
 $packageZip = Join-Path $outputRoot "noizemaker-windows.zip"
+$iconIco = Join-Path $repoRoot "assets\noizemaker_icon.ico"
 
 function Reset-Dir([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
@@ -67,6 +69,22 @@ function Assert-PathExists([string]$Path, [string]$Message) {
     }
 }
 
+function Set-ExeIcon([string]$ExePath, [string]$IconPath, [string]$ToolPath) {
+    if (-not (Test-Path -LiteralPath $IconPath)) {
+        Write-Host "Skipping exe icon stamping because no .ico file was found at $IconPath"
+        return
+    }
+
+    $rceditUrl = "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
+    Write-Host "Downloading rcedit from $rceditUrl"
+    Invoke-WebRequest -Uri $rceditUrl -OutFile $ToolPath
+
+    & $ToolPath $ExePath --set-icon $IconPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "rcedit failed while stamping the Windows executable icon."
+    }
+}
+
 Reset-Dir $buildRoot
 Reset-Dir $outputRoot
 New-Item -ItemType Directory -Path $packageRoot | Out-Null
@@ -82,9 +100,11 @@ if (-not $loveExtracted) {
 }
 
 $archiveItems = @(
+    (Join-Path $repoRoot "conf.lua"),
     (Join-Path $repoRoot "main.lua"),
     (Join-Path $repoRoot "core"),
     (Join-Path $repoRoot "ui"),
+    (Join-Path $repoRoot "assets"),
     (Join-Path $repoRoot "README.md")
 )
 
@@ -100,6 +120,7 @@ Assert-PathExists $loveExePackaged "The LOVE runtime files were not copied into 
 
 Copy-FileBytes $loveExeSource (Join-Path $packageRoot "noizemaker.exe")
 Append-FileBytes (Join-Path $packageRoot "noizemaker.exe") $gameLove
+Set-ExeIcon (Join-Path $packageRoot "noizemaker.exe") $iconIco $rceditExe
 
 Remove-Item -LiteralPath $loveExePackaged -Force
 Copy-Item -LiteralPath $gameLove -Destination (Join-Path $packageRoot "noizemaker.love") -Force

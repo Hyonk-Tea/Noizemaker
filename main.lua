@@ -2,6 +2,27 @@ local App = require("ui.app")
 
 local app
 
+local function try_set_window_icon()
+    local path = nil
+    if love.filesystem.getInfo("assets/noizemaker_icon.png") then
+        path = "assets/noizemaker_icon.png"
+    elseif love.filesystem.getInfo("assets/noizemaker_icon.tga") then
+        path = "assets/noizemaker_icon.tga"
+    end
+    if not path then
+        return false, "missing app icon file"
+    end
+
+    local ok, err = pcall(function()
+        local imagedata = love.image.newImageData(path)
+        love.window.setIcon(imagedata)
+    end)
+    if not ok then
+        return false, tostring(err)
+    end
+    return true, path
+end
+
 function love.load(args)
     love.window.setTitle("Noizemaker")
     love.window.setMode(1280, 720, {
@@ -9,9 +30,13 @@ function love.load(args)
         minwidth = 960,
         minheight = 600,
     })
+    local icon_ok, icon_detail = try_set_window_icon()
 
     app = App.new()
     app:load(args or {})
+    if app and not icon_ok then
+        app.status_text = "Window icon load failed: " .. tostring(icon_detail)
+    end
 end
 
 function love.update(dt)
