@@ -4,6 +4,7 @@ local rules = require("core.rules")
 local modcore = require("core.mods")
 local noize = require("core.noize")
 local platform = require("core.platform")
+local gamebanana = require("core.gamebanana")
 local theme = require("ui.theme")
 local widgets = require("ui.widgets")
 local tree = require("ui.tree")
@@ -18,6 +19,11 @@ local VIEW_TRANSITION_DURATION = 0.18
 local VIEW_TRANSITION_SLIDE = 28
 local MODAL_ANIM_DURATION = 0.14
 local MODAL_ANIM_OFFSET = 12
+local MENU_BUTTON_W = 248
+local MENU_BUTTON_H = 48
+local MENU_BUTTON_GAP = 14
+local RECENT_FILE_LIMIT = 8
+local RECENT_RELEASE_LIMIT = 2
 
 local MOVE_BUTTONS = {
     { label = "UP", code = format.GAME_TO_INTERNAL.UP },
@@ -179,7 +185,7 @@ local function parse_ini(path)
     return data
 end
 
-local function write_config(path, game_root, noize_prompt_preference)
+local function write_config(path, game_root, noize_prompt_preference, recent_files, gamebanana_previews_preference)
     local fh = io.open(path, "w")
     if not fh then
         return false
@@ -190,6 +196,14 @@ local function write_config(path, game_root, noize_prompt_preference)
     end
     fh:write("[noize]\n")
     fh:write("prompt = ", trim(noize_prompt_preference or "ask"), "\n")
+    fh:write("\n[gamebanana]\n")
+    fh:write("previews = ", trim(gamebanana_previews_preference or "ask"), "\n")
+    if recent_files and #recent_files > 0 then
+        fh:write("\n[recent_files]\n")
+        for i = 1, #recent_files do
+            fh:write("file", i, " = ", normalize_slashes(recent_files[i]), "\n")
+        end
+    end
     fh:close()
     return true
 end
@@ -291,6 +305,88 @@ local function clamp(value, min_value, max_value)
     return value
 end
 
+local function snap_scale(value, step, min_value)
+    local unit = step or 0.5
+    local snapped = math.floor((value / unit) + 0.5) * unit
+    if min_value and snapped < min_value then
+        return min_value
+    end
+    return snapped
+end
+
+local function clamp_text_lines(font, text, width, max_lines)
+    local value = trim(tostring(text or ""))
+    if value == "" or width <= 0 or max_lines <= 0 then
+        return value
+    end
+
+    local _, wrapped = font:getWrap(value, width)
+    if #wrapped <= max_lines then
+        return value
+    end
+
+    local words = {}
+    for word in value:gmatch("%S+") do
+        words[#words + 1] = word
+    end
+    if #words == 0 then
+        return value
+    end
+
+    local best = ""
+    for i = 1, #words do
+        local candidate = table.concat(words, " ", 1, i)
+        local _, lines = font:getWrap(candidate, width)
+        if #lines > max_lines then
+            break
+        end
+        best = candidate
+    end
+
+    if best == "" then
+        best = words[1]
+        while #best > 1 do
+            local candidate = best:sub(1, -2) .. "..."
+            local _, lines = font:getWrap(candidate, width)
+            if #lines <= max_lines then
+                return candidate
+            end
+            best = best:sub(1, -2)
+        end
+        return "..."
+    end
+
+    local ellipsized = best .. "..."
+    local _, lines = font:getWrap(ellipsized, width)
+    if #lines <= max_lines then
+        return ellipsized
+    end
+
+    while #best > 1 do
+        best = best:gsub("%s*%S+$", "")
+        if best == "" then
+            break
+        end
+        ellipsized = best .. "..."
+        _, lines = font:getWrap(ellipsized, width)
+        if #lines <= max_lines then
+            return ellipsized
+        end
+    end
+
+    best = value
+    while #best > 1 do
+        best = best:sub(1, -2)
+        ellipsized = best .. "..."
+        _, lines = font:getWrap(ellipsized, width)
+        if #lines <= max_lines then
+            return ellipsized
+        end
+    end
+
+    return "..."
+end
+
 local function ease_out_cubic(t)
     t = clamp(t or 0, 0, 1)
     local inv = 1 - t
@@ -378,8 +474,9 @@ function App.new()
         mods_tab = mods_tab.new_state(),
         timeline_render = nil,
         hovered_button = nil,
+        hovered_menu_button = nil,
         status_text = "Ready.",
-        active_view = "editor",
+        active_view = "menu",
         app_root = root,
         config_path = join_path(root, "config.ini"),
         mod_base_dir = root,
@@ -412,15 +509,26 @@ function App.new()
         inspector_hits = {},
         controls_hits = {},
         modal_hits = {},
+        menu_hits = {},
+        header_hits = {},
+        recent_hits = {},
+        release_hits = {},
         modal = nil,
         modal_anim = nil,
         snap_index = 1,
         launch_args = {},
         view_transition = nil,
         view_canvases = {},
+        toolbar_visible = false,
         noize_protocol_prompt_preference = "ask",
         noize_protocol_prompt_shown = false,
         noize_protocol_registration_attempted = false,
+        gamebanana_previews_preference = "ask",
+        recent_files = {},
+        ui_images = {},
+        release_feed = { status = "idle", items = {}, error = nil, from_cache = false },
+        release_images = {},
+        release_cache_dir = join_path(root, "cache/gamebanana"),
     }, App)
 end
 
@@ -428,6 +536,7 @@ function App:load(args)
     theme.init()
     self.launch_args = args or {}
     self:load_config()
+    self:load_ui_assets()
     self:refresh_optional_assets()
     modcore.ensure_environment(self.mod_base_dir)
     self:refresh_installed_mods()
@@ -436,6 +545,9 @@ function App:load(args)
     end
     self:resize(love.graphics.getWidth(), love.graphics.getHeight())
     self:handle_launch_args(self.launch_args)
+    if self.active_view == "menu" then
+        self:ensure_recent_releases_loaded()
+    end
 end
 
 function App:update(dt)
@@ -459,7 +571,49 @@ end
 
 function App:update_hover_state()
     self.hovered_button = nil
+    self.hovered_menu_button = nil
     local mx, my = love.mouse.getPosition()
+    if self.active_view == "menu" then
+        for i = 1, #self.header_hits do
+            local hit = self.header_hits[i]
+            if widgets.point_in_rect(mx, my, hit.rect) then
+                self.hovered_button = hit.kind == "back" and "header_back" or ("header_" .. hit.id)
+                return
+            end
+        end
+        for i = 1, #self.menu_hits do
+            local hit = self.menu_hits[i]
+            if widgets.point_in_rect(mx, my, hit.rect) then
+                self.hovered_menu_button = hit.id
+                return
+            end
+        end
+        for i = 1, #self.recent_hits do
+            local hit = self.recent_hits[i]
+            if widgets.point_in_rect(mx, my, hit.rect) then
+                self.hovered_button = "recent_" .. i
+                return
+            end
+        end
+        for i = 1, #self.release_hits do
+            local hit = self.release_hits[i]
+            if widgets.point_in_rect(mx, my, hit.rect) then
+                self.hovered_button = hit.id
+                return
+            end
+        end
+        return
+    end
+    for i = 1, #self.header_hits do
+        local hit = self.header_hits[i]
+        if widgets.point_in_rect(mx, my, hit.rect) then
+            self.hovered_button = hit.kind == "back" and "header_back" or ("header_" .. hit.id)
+            return
+        end
+    end
+    if self.active_view ~= "editor" then
+        return
+    end
     local buttons = self:buttons()
     for key, rect in pairs(buttons) do
         if widgets.point_in_rect(mx, my, rect) then
@@ -474,6 +628,25 @@ function App:refresh_installed_mods()
     mods_tab.sync_selection(self.mods_tab, self.installed_mods)
 end
 
+function App:add_recent_file(path)
+    local normalized = normalize_slashes(path or "")
+    if normalized == "" then
+        return
+    end
+
+    local updated = { normalized }
+    for i = 1, #self.recent_files do
+        if self.recent_files[i] ~= normalized then
+            updated[#updated + 1] = self.recent_files[i]
+        end
+        if #updated >= RECENT_FILE_LIMIT then
+            break
+        end
+    end
+    self.recent_files = updated
+    self:save_config()
+end
+
 function App:load_config()
     local cfg = parse_ini(self.config_path)
     if cfg and cfg.paths and cfg.paths.game_root then
@@ -482,10 +655,32 @@ function App:load_config()
     if cfg and cfg.noize and cfg.noize.prompt and cfg.noize.prompt ~= "" then
         self.noize_protocol_prompt_preference = trim(cfg.noize.prompt):lower()
     end
+    if cfg and cfg.gamebanana and cfg.gamebanana.previews and cfg.gamebanana.previews ~= "" then
+        self.gamebanana_previews_preference = trim(cfg.gamebanana.previews):lower()
+    end
+    self.recent_files = {}
+    if cfg and cfg.recent_files then
+        local indexed = {}
+        for key, value in pairs(cfg.recent_files) do
+            local index = tonumber(key:match("^file(%d+)$"))
+            if index and value and value ~= "" then
+                indexed[#indexed + 1] = {
+                    index = index,
+                    value = normalize_slashes(value),
+                }
+            end
+        end
+        table.sort(indexed, function(a, b)
+            return a.index < b.index
+        end)
+        for i = 1, #indexed do
+            self.recent_files[#self.recent_files + 1] = indexed[i].value
+        end
+    end
 end
 
 function App:save_config()
-    write_config(self.config_path, self.game_root, self.noize_protocol_prompt_preference)
+    write_config(self.config_path, self.game_root, self.noize_protocol_prompt_preference, self.recent_files, self.gamebanana_previews_preference)
 end
 
 function App:refresh_optional_assets()
@@ -493,6 +688,154 @@ function App:refresh_optional_assets()
     if self.game_root and valid_game_root(self.game_root) then
         self.title_font_renderer = widgets.try_load_bitmap_title(join_path(self.game_root, "font/font_ulala_blue.tga"))
     end
+end
+
+function App:load_ui_assets()
+    self.ui_images = {}
+    local names = {
+        "noizemaker.png",
+        "sc5logo.png",
+        "sc5gear.png",
+        "noizemaker_icon.png",
+    }
+    for i = 1, #names do
+        local path = "assets/" .. names[i]
+        if love.filesystem.getInfo(path) then
+            local ok, image = pcall(love.graphics.newImage, path)
+            if ok and image then
+                image:setFilter("nearest", "nearest")
+                self.ui_images[names[i]] = image
+            end
+        end
+    end
+end
+
+function App:load_release_image(path, key)
+    local bytes = read_binary(path)
+    if not bytes or bytes == "" then
+        return nil
+    end
+
+    local ok, image = pcall(function()
+        local filedata = love.filesystem.newFileData(bytes, basename(path))
+        local imagedata = love.image.newImageData(filedata)
+        local loaded = love.graphics.newImage(imagedata)
+        loaded:setFilter("linear", "linear")
+        return loaded
+    end)
+    if ok and image then
+        self.release_images[key] = image
+        return image
+    end
+    return nil
+end
+
+function App:load_modal_image(path)
+    local bytes = read_binary(path)
+    if not bytes or bytes == "" then
+        return nil
+    end
+
+    local ok, image = pcall(function()
+        local filedata = love.filesystem.newFileData(bytes, basename(path))
+        local imagedata = love.image.newImageData(filedata)
+        local loaded = love.graphics.newImage(imagedata)
+        loaded:setFilter("linear", "linear")
+        return loaded
+    end)
+    if ok and image then
+        return image
+    end
+    return nil
+end
+
+function App:refresh_recent_releases(force)
+    if self.gamebanana_previews_preference ~= "enabled" then
+        self.release_feed = {
+            status = "disabled",
+            items = {},
+            error = nil,
+            from_cache = false,
+        }
+        self.release_images = {}
+        return
+    end
+    if self.release_feed.status == "loading" then
+        return
+    end
+    if not force and self.release_feed.status == "ready" and #self.release_feed.items > 0 then
+        return
+    end
+
+    self.release_feed.status = "loading"
+    self.release_feed.error = nil
+
+    local feed, err = gamebanana.fetch_recent_mods(self.release_cache_dir, RECENT_RELEASE_LIMIT)
+    if not feed then
+        self.release_feed = {
+            status = "error",
+            items = {},
+            error = err or "Recent GameBanana releases could not be loaded.",
+            from_cache = false,
+        }
+        return
+    end
+
+    self.release_feed = {
+        status = "ready",
+        items = feed.items or {},
+        error = nil,
+        from_cache = feed.from_cache or false,
+    }
+    self.release_images = {}
+    for i = 1, #self.release_feed.items do
+        local item = self.release_feed.items[i]
+        local path = gamebanana.cache_preview_image(item, self.release_cache_dir)
+        if path then
+            self:load_release_image(path, tostring(item.id))
+        end
+    end
+end
+
+function App:ensure_recent_releases_loaded()
+    if self.gamebanana_previews_preference ~= "enabled" then
+        return
+    end
+    if self.release_feed.status == "idle" then
+        self:refresh_recent_releases(false)
+    end
+end
+
+function App:prompt_gamebanana_previews()
+    self:show_modal({
+        title = "Enable GameBanana previews?",
+        message = table.concat({
+            "Noizemaker can show recent Space Channel 5 Part 2 mod releases from GameBanana on the main menu.",
+            "",
+            "This downloads a small feed and preview images, then caches them for 60 minutes.",
+        }, "\n"),
+        kind = "info",
+        dismiss_id = "later",
+        buttons = {
+            { id = "later", label = "Not now" },
+            { id = "never", label = "Never" },
+            { id = "enable", label = "Enable", primary = true },
+        },
+        on_result = function(result_id)
+            if result_id == "enable" then
+                self.gamebanana_previews_preference = "enabled"
+                self:save_config()
+                self.status_text = "Enabled GameBanana previews."
+                self:refresh_recent_releases(true)
+            elseif result_id == "never" then
+                self.gamebanana_previews_preference = "never"
+                self:save_config()
+                self.status_text = "GameBanana previews disabled."
+            else
+                self.status_text = "GameBanana previews skipped for now."
+            end
+        end,
+    })
 end
 
 function App:prompt_for_game_root()
@@ -558,6 +901,29 @@ function App:protocol_launch_target()
     return {
         executable = executable,
     }
+end
+
+function App:find_game_executable()
+    if not valid_game_root(self.game_root) then
+        return nil
+    end
+
+    local candidates = {
+        "Space Channel 5 Part 2.exe",
+        "AppLauncher.exe",
+    }
+    for i = 1, #candidates do
+        local candidate = join_path(self.game_root, candidates[i])
+        if file_exists(candidate) then
+            return candidate
+        end
+    end
+    return nil
+end
+
+function App:launch_game()
+    self:show_info("Launch", "Whoops, this feature is not implemented yet. Sorry about that.")
+    return false
 end
 
 function App:ensure_noize_protocol_registration()
@@ -780,6 +1146,7 @@ function App:open_file(path)
     self.current_file_name = basename(path)
     self.current_file_dir = normalize_slashes(path:match("^(.*)[/\\][^/\\]+$") or ".")
     self.current_patch_path = nil
+    self:add_recent_file(path)
     self:rebuild_tree_groups()
     if self.entries[1] then
         self:load_work_for_entry(self.entries[1])
@@ -825,6 +1192,9 @@ function App:switch_view(view_name)
         }
     else
         self.view_transition = nil
+    end
+    if target == "menu" then
+        self:ensure_recent_releases_loaded()
     end
     self.pending_insert = nil
 end
@@ -906,6 +1276,7 @@ function App:show_modal(spec)
         title = spec.title or "Notice",
         message = tostring(spec.message or ""),
         kind = spec.kind or "info",
+        image = spec.image or nil,
         buttons = spec.buttons or {
             { id = "ok", label = "OK", primary = true },
         },
@@ -945,6 +1316,29 @@ function App:request_confirm(title, message, ok_label, on_confirm, on_cancel)
         title = title or "Confirm",
         message = tostring(message or ""),
         kind = "warning",
+        dismiss_id = "cancel",
+        buttons = {
+            { id = "cancel", label = "Cancel" },
+            { id = "confirm", label = ok_label or "OK", primary = true },
+        },
+        on_result = function(result_id)
+            if result_id == "confirm" then
+                if on_confirm then
+                    on_confirm()
+                end
+            elseif on_cancel then
+                on_cancel()
+            end
+        end,
+    })
+end
+
+function App:request_confirm_with_image(title, message, image, ok_label, on_confirm, on_cancel)
+    self:show_modal({
+        title = title or "Confirm",
+        message = tostring(message or ""),
+        kind = "warning",
+        image = image,
         dismiss_id = "cancel",
         buttons = {
             { id = "cancel", label = "Cancel" },
@@ -1016,6 +1410,10 @@ function App:modal_progress()
 end
 
 function App:draw_view_content(view_name)
+    if view_name == "menu" then
+        self:draw_main_menu()
+        return
+    end
     if view_name == "mods" then
         mods_tab.draw(self.mods_tab, self.layout.mods, self.installed_mods, {
             game_root = self.game_root,
@@ -1088,11 +1486,12 @@ function App:draw_modal()
 
     local accent, soft = self:modal_color(self.modal.kind)
     local has_input = self.modal.input ~= nil
+    local has_image = self.modal.image ~= nil
     local panel = {
         x = math.floor((sw - 560) * 0.5),
         y = math.floor((sh - 300) * 0.5 + (1 - progress) * MODAL_ANIM_OFFSET),
         w = 560,
-        h = has_input and 340 or 300,
+        h = has_input and 340 or (has_image and 360 or 300),
     }
     if panel.w > sw - 40 then
         panel.x = 20
@@ -1126,13 +1525,42 @@ function App:draw_modal()
 
     love.graphics.setFont(theme.font("body"))
     love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
-    love.graphics.printf(self.modal.message, panel.x + 18, panel.y + 64, panel.w - 36, "left")
+    local content_bottom = panel.y + 64
+    if has_image then
+        local image_rect = {
+            x = panel.x + 18,
+            y = panel.y + 64,
+            w = 160,
+            h = 96,
+        }
+        widgets.draw_panel(image_rect, {
+            fill = theme.colors.panel_alt,
+            border = theme.colors.border_soft,
+            radius = 10,
+        })
+        local image = self.modal.image
+        local scale = math.min(image_rect.w / image:getWidth(), image_rect.h / image:getHeight())
+        local draw_w = image:getWidth() * scale
+        local draw_h = image:getHeight() * scale
+        local draw_x = image_rect.x + math.floor((image_rect.w - draw_w) * 0.5)
+        local draw_y = image_rect.y + math.floor((image_rect.h - draw_h) * 0.5)
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.draw(image, draw_x, draw_y, 0, scale, scale)
 
-    local input_bottom = panel.y + panel.h - 70
+        love.graphics.setFont(theme.font("body"))
+        love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+        love.graphics.printf(self.modal.message, image_rect.x + image_rect.w + 14, image_rect.y, panel.w - image_rect.w - 50, "left")
+        content_bottom = image_rect.y + image_rect.h + 18
+    else
+        love.graphics.printf(self.modal.message, panel.x + 18, panel.y + 64, panel.w - 36, "left")
+        content_bottom = panel.y + 170
+    end
+
+    local input_bottom = math.max(content_bottom, panel.y + panel.h - 70)
     if self.modal.input then
         local input_rect = {
             x = panel.x + 18,
-            y = panel.y + 170,
+            y = math.max(content_bottom, panel.y + 170),
             w = panel.w - 36,
             h = 38,
         }
@@ -1298,13 +1726,12 @@ function App:restore_original_files()
 end
 
 function App:buttons()
-    local top = self.layout.topbar
+    local top = self.layout.toolbar
     return {
-        open = { x = top.x + 16, y = top.y + 10, w = 88, h = 32, label = "Open" },
-        apply = { x = top.x + 112, y = top.y + 10, w = 88, h = 32, label = "Apply" },
-        patch = { x = top.x + 208, y = top.y + 10, w = 88, h = 32, label = "Patch" },
-        settings = { x = top.x + 304, y = top.y + 10, w = 108, h = 32, label = "Settings" },
-        mods = { x = top.x + top.w - 100, y = top.y + 10, w = 84, h = 32, label = "Mods" },
+        open = { x = top.x + 16, y = top.y + 7, w = 82, h = 26, label = "Open" },
+        apply = { x = top.x + 106, y = top.y + 7, w = 82, h = 26, label = "Apply" },
+        patch = { x = top.x + 196, y = top.y + 7, w = 82, h = 26, label = "Patch" },
+        settings = { x = top.x + 286, y = top.y + 7, w = 100, h = 26, label = "Settings" },
     }
 end
 
@@ -1323,10 +1750,12 @@ function App:ensure_view_canvases(w, h)
         return
     end
 
+    local ok_menu, menu_canvas = pcall(love.graphics.newCanvas, w, h)
     local ok_editor, editor_canvas = pcall(love.graphics.newCanvas, w, h)
     local ok_mods, mods_canvas = pcall(love.graphics.newCanvas, w, h)
-    if ok_editor and ok_mods then
+    if ok_menu and ok_editor and ok_mods then
         self.view_canvases = {
+            menu = menu_canvas,
             editor = editor_canvas,
             mods = mods_canvas,
         }
@@ -1336,14 +1765,17 @@ function App:ensure_view_canvases(w, h)
 end
 
 function App:resize(w, h)
-    self.layout.topbar = { x = 0, y = 0, w = w, h = 54 }
-    self.layout.left = { x = 16, y = 68, w = 300, h = h - 84 }
-    self.layout.right = { x = w - 356, y = 68, w = 340, h = h - 84 }
+    self.layout.topbar = { x = 0, y = 0, w = w, h = 44 }
+    self.layout.toolbar = { x = 0, y = 44, w = w, h = 40 }
+    self.layout.menu = { x = 0, y = self.layout.topbar.h, w = w, h = h - self.layout.topbar.h }
+    local content_y = self.layout.toolbar.y + self.layout.toolbar.h + 10
+    self.layout.left = { x = 16, y = content_y, w = 300, h = h - content_y - 16 }
+    self.layout.right = { x = w - 356, y = content_y, w = 340, h = h - content_y - 16 }
     self.layout.center = {
         x = self.layout.left.x + self.layout.left.w + 16,
-        y = 68,
+        y = content_y,
         w = w - self.layout.left.w - self.layout.right.w - 48,
-        h = h - 84,
+        h = h - content_y - 16,
     }
     local controls_h = self:use_compact_move_grid(self.layout.center.w) and 182 or 150
     self.layout.controls = {
@@ -1360,9 +1792,9 @@ function App:resize(w, h)
     }
     self.layout.mods = {
         x = 16,
-        y = 68,
+        y = content_y,
         w = w - 32,
-        h = h - 84,
+        h = h - content_y - 16,
     }
     self:ensure_view_canvases(w, h)
 end
@@ -1380,9 +1812,79 @@ function App:draw_background()
     end
 end
 
+function App:header_items()
+    if self.active_view == "editor" then
+        return {
+            { id = "main_menu", label = "Main Menu" },
+            { id = "editor", label = "Noizemaker" },
+        }
+    end
+    if self.active_view == "mods" then
+        return {
+            { id = "main_menu", label = "Main Menu" },
+            { id = "mods", label = "Mods" },
+        }
+    end
+    return {
+        { id = "main_menu", label = "Main Menu" },
+    }
+end
+
 function App:draw_topbar()
     local top = self.layout.topbar
     widgets.draw_panel(top, { fill = theme.colors.panel_soft, border = theme.colors.border, radius = 0 })
+    self.header_hits = {}
+
+    local back_rect = { x = top.x + 14, y = top.y + 8, w = 30, h = 26 }
+    local back_disabled = self.active_view == "menu"
+    widgets.draw_button(back_rect, "<", {
+        font = theme.font("small"),
+        disabled = back_disabled,
+        hovered = self.hovered_button == "header_back",
+        radius = 7,
+    })
+    self.header_hits[#self.header_hits + 1] = { kind = "back", rect = back_rect, disabled = back_disabled }
+
+    local cursor_x = back_rect.x + back_rect.w + 10
+    local items = self:header_items()
+    love.graphics.setFont(theme.font("small"))
+    for i = 1, #items do
+        local item = items[i]
+        local text_w = love.graphics.getFont():getWidth(item.label) + 18
+        local rect_item = {
+            x = cursor_x,
+            y = top.y + 8,
+            w = text_w,
+            h = 26,
+        }
+        widgets.draw_button(rect_item, item.label, {
+            font = theme.font("small"),
+            fill = i == #items and theme.colors.selection_soft or theme.colors.panel_alt,
+            hover_fill = theme.colors.button_hover,
+            border = i == #items and theme.colors.selection or theme.colors.border_soft,
+            hovered = self.hovered_button == ("header_" .. item.id),
+            radius = 7,
+        })
+        self.header_hits[#self.header_hits + 1] = {
+            kind = "crumb",
+            id = item.id,
+            rect = rect_item,
+        }
+        cursor_x = rect_item.x + rect_item.w + 8
+        if i < #items then
+            love.graphics.setColor(theme.colors.border_soft[1], theme.colors.border_soft[2], theme.colors.border_soft[3], 1)
+            love.graphics.rectangle("fill", cursor_x, top.y + 13, 1, 18)
+            cursor_x = cursor_x + 8
+        end
+    end
+end
+
+function App:draw_editor_toolbar()
+    if self.active_view ~= "editor" then
+        return
+    end
+    local top = self.layout.toolbar
+    widgets.draw_panel(top, { fill = theme.colors.panel_alt, border = theme.colors.border_soft, radius = 0 })
 
     local buttons = self:buttons()
     widgets.draw_button(buttons.open, buttons.open.label, { hovered = self.hovered_button == "open" })
@@ -1395,27 +1897,382 @@ function App:draw_topbar()
         disabled = self.active_view ~= "editor" or not self.current_buffer,
     })
     widgets.draw_button(buttons.settings, buttons.settings.label, { hovered = self.hovered_button == "settings" })
-    widgets.draw_button(buttons.mods, buttons.mods.label, {
-        hovered = self.hovered_button == "mods",
-        fill = self.active_view == "mods" and theme.colors.selection_soft or theme.colors.button,
-        border = self.active_view == "mods" and theme.colors.accent or theme.colors.border,
-    })
 
     local file_x = buttons.settings.x + buttons.settings.w + 12
     local file_rect = {
         x = file_x,
-        y = top.y + 10,
-        w = math.max(80, buttons.mods.x - file_x - 12),
-        h = 32,
+        y = top.y + 7,
+        w = math.max(120, top.w - file_x - 16),
+        h = 26,
     }
     widgets.draw_panel(file_rect, {
         fill = theme.colors.panel,
-        border = self.active_view == "mods" and theme.colors.selection or theme.colors.border_soft,
+        border = theme.colors.border_soft,
         radius = 10,
     })
     love.graphics.setFont(theme.font("small"))
     love.graphics.setColor(theme.colors.text_dim[1], theme.colors.text_dim[2], theme.colors.text_dim[3], 1)
-    love.graphics.printf(self.current_file_name, file_rect.x + 12, file_rect.y + 8, file_rect.w - 24, "left")
+    love.graphics.printf(self.current_file_name, file_rect.x + 12, file_rect.y + 6, file_rect.w - 24, "left")
+end
+
+function App:draw_main_menu()
+    local rect = self.layout.menu
+    self.menu_hits = {}
+    self.recent_hits = {}
+    self.release_hits = {}
+
+    local title_x = rect.x + 44
+    local title_y = rect.y + 30
+
+    if self.title_font_renderer then
+        local text = "NOIZEMAKER"
+        local base_w, base_h = self.title_font_renderer:measure(text, 1.0)
+        local scale = math.min(1.65, (rect.w * 0.42) / math.max(base_w, 1))
+        scale = snap_scale(scale, 0.25, 1.0)
+        self.title_font_renderer:draw(text, title_x, title_y, scale, theme.colors.text)
+    else
+        love.graphics.setFont(theme.font("title"))
+        love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+        love.graphics.print("Noizemaker", title_x, title_y + 10)
+    end
+
+    local margin_x = 40
+    local panel_y = rect.y + 132
+    local panel_h = math.min(rect.h - 184, 430)
+    local feed_w = math.min(320, rect.w * 0.28)
+    local gap = 24
+    local shell_rect = {
+        x = rect.x + margin_x,
+        y = panel_y,
+        w = rect.w - margin_x * 2 - feed_w - gap,
+        h = panel_h,
+    }
+    local feed_rect = {
+        x = shell_rect.x + shell_rect.w + gap,
+        y = panel_y,
+        w = feed_w,
+        h = panel_h,
+    }
+
+    widgets.draw_panel(shell_rect, {
+        fill = theme.colors.panel_elevated,
+        border = theme.colors.border,
+        radius = 28,
+    })
+    love.graphics.setColor(theme.colors.selection_soft[1], theme.colors.selection_soft[2], theme.colors.selection_soft[3], 0.55)
+    love.graphics.polygon("fill",
+        shell_rect.x + 28, shell_rect.y + shell_rect.h - 26,
+        shell_rect.x + shell_rect.w * 0.55, shell_rect.y + 58,
+        shell_rect.x + shell_rect.w - 42, shell_rect.y + 96,
+        shell_rect.x + shell_rect.w - 24, shell_rect.y + shell_rect.h - 34
+    )
+    love.graphics.setColor(theme.colors.panel_soft[1], theme.colors.panel_soft[2], theme.colors.panel_soft[3], 0.85)
+    love.graphics.rectangle("fill", shell_rect.x + 330, shell_rect.y + 26, 1, shell_rect.h - 52)
+
+    local recent_rect = {
+        x = shell_rect.x + 18,
+        y = shell_rect.y + 18,
+        w = 292,
+        h = shell_rect.h - 36,
+    }
+    widgets.draw_panel(recent_rect, {
+        fill = { theme.colors.panel[1], theme.colors.panel[2], theme.colors.panel[3], 0.92 },
+        border = { theme.colors.border_soft[1], theme.colors.border_soft[2], theme.colors.border_soft[3], 0.7 },
+        radius = 22,
+    })
+
+    love.graphics.setFont(theme.font("small"))
+    love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+    love.graphics.print("Recent Files", recent_rect.x + 18, recent_rect.y + 16)
+
+    local recent_y = recent_rect.y + 58
+    if #self.recent_files == 0 then
+        love.graphics.setFont(theme.font("body"))
+        love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+        love.graphics.printf("No files yet. Open a DGSH file in the editor and it will show up here.", recent_rect.x + 18, recent_y + 10, recent_rect.w - 36, "left")
+    else
+        for i = 1, math.min(#self.recent_files, RECENT_FILE_LIMIT) do
+            local path = self.recent_files[i]
+            local row_rect = {
+                x = recent_rect.x + 14,
+                y = recent_y,
+                w = recent_rect.w - 28,
+                h = 42,
+            }
+            local exists = file_exists(path)
+            widgets.draw_panel(row_rect, {
+                fill = self.hovered_button == ("recent_" .. i) and theme.colors.button_hover or theme.colors.panel,
+                border = exists and theme.colors.border_soft or theme.colors.danger,
+                radius = 12,
+            })
+            love.graphics.setFont(theme.font("small"))
+            love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+            love.graphics.print(basename(path), row_rect.x + 12, row_rect.y + 8)
+            love.graphics.setFont(theme.font("tiny"))
+            love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+            love.graphics.printf(path, row_rect.x + 12, row_rect.y + 24, row_rect.w - 24, "left")
+            self.recent_hits[#self.recent_hits + 1] = {
+                rect = row_rect,
+                path = path,
+            }
+            recent_y = recent_y + 50
+        end
+    end
+
+    local center_rect = {
+        x = recent_rect.x + recent_rect.w + 26,
+        y = shell_rect.y + 18,
+        w = shell_rect.w - recent_rect.w - 44,
+        h = shell_rect.h - 36,
+    }
+    widgets.draw_panel(center_rect, {
+        fill = { theme.colors.panel_soft[1], theme.colors.panel_soft[2], theme.colors.panel_soft[3], 0.88 },
+        border = { theme.colors.border_soft[1], theme.colors.border_soft[2], theme.colors.border_soft[3], 0.72 },
+        radius = 24,
+    })
+
+    local function draw_icon_button(button)
+        widgets.draw_panel(button.rect, {
+            fill = self.hovered_menu_button == button.id and (button.hover_fill or theme.colors.button_hover) or button.fill,
+            border = button.border,
+            radius = 16,
+        })
+
+        local icon = self.ui_images[button.icon]
+        local text_x = button.rect.x + 18
+        if icon then
+            local icon_box = 32
+            local scale = math.min(icon_box / icon:getHeight(), icon_box / icon:getWidth())
+            local scaled_w = icon:getWidth() * scale
+            local scaled_h = icon:getHeight() * scale
+            local draw_x = button.rect.x + 14
+            local draw_y = button.rect.y + math.floor((button.rect.h - scaled_h) * 0.5)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.draw(icon, draw_x, draw_y, 0, scale, scale)
+            text_x = draw_x + scaled_w + 12
+        end
+
+        if self.title_font_renderer then
+            local text = button.label:upper()
+            local base_w, base_h = self.title_font_renderer:measure(text, 1.0)
+            local scale = math.min((button.rect.w - (text_x - button.rect.x) - 18) / math.max(base_w, 1), 22 / math.max(base_h, 1))
+            scale = snap_scale(scale, 0.25, 1.0)
+            local draw_y = button.rect.y + math.floor((button.rect.h - (base_h * scale)) * 0.5)
+            self.title_font_renderer:draw(text, text_x, draw_y, scale, theme.colors.text)
+        else
+            love.graphics.setFont(theme.font("small"))
+            love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+            love.graphics.print(button.label, text_x, button.rect.y + 12)
+        end
+
+        self.menu_hits[#self.menu_hits + 1] = {
+            id = button.id,
+            rect = button.rect,
+        }
+    end
+
+    local left_x = center_rect.x + 34
+    local top_y = center_rect.y + 28
+    local half_w = math.floor((center_rect.w - 68 - 14) * 0.5)
+    local full_w = center_rect.w - 68
+
+    local menu_buttons = {
+        {
+            id = "mods",
+            label = "Mods",
+            icon = "noizemaker_icon.png",
+            fill = theme.colors.selection_soft,
+            hover_fill = theme.colors.accent_soft,
+            border = theme.colors.selection,
+            rect = { x = left_x, y = top_y, w = half_w, h = 58 },
+        },
+        {
+            id = "launch",
+            label = "Launch",
+            icon = "sc5logo.png",
+            fill = theme.colors.button,
+            hover_fill = theme.colors.button_hover,
+            border = theme.colors.border_soft,
+            rect = { x = left_x + half_w + 14, y = top_y, w = half_w, h = 58 },
+        },
+        {
+            id = "editor",
+            label = "Noizemaker",
+            icon = "noizemaker.png",
+            fill = theme.colors.button,
+            hover_fill = theme.colors.button_hover,
+            border = theme.colors.border_soft,
+            rect = { x = left_x, y = top_y + 78, w = full_w, h = 66 },
+        },
+        {
+            id = "settings",
+            label = "Settings",
+            icon = "sc5gear.png",
+            fill = theme.colors.button,
+            hover_fill = theme.colors.button_hover,
+            border = theme.colors.border_soft,
+            rect = { x = left_x, y = top_y + 162, w = full_w, h = 58 },
+        },
+    }
+
+    for i = 1, #menu_buttons do
+        draw_icon_button(menu_buttons[i])
+    end
+
+    widgets.draw_panel(feed_rect, {
+        fill = { theme.colors.panel_elevated[1], theme.colors.panel_elevated[2], theme.colors.panel_elevated[3], 0.94 },
+        border = theme.colors.border,
+        radius = 24,
+    })
+
+    love.graphics.setFont(theme.font("small"))
+    love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+    love.graphics.print("Latest Mods", feed_rect.x + 18, feed_rect.y + 16)
+
+    love.graphics.setFont(theme.font("tiny"))
+    love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+    local subtitle
+    if self.gamebanana_previews_preference == "enabled" then
+        subtitle = self.release_feed.from_cache and "GameBanana feed (cached)" or "Recent releases from GameBanana"
+    elseif self.gamebanana_previews_preference == "never" then
+        subtitle = "GameBanana previews are disabled"
+    else
+        subtitle = "Optional GameBanana menu panel"
+    end
+    love.graphics.print(subtitle, feed_rect.x + 18, feed_rect.y + 38)
+
+    local list_y = feed_rect.y + 62
+    if self.gamebanana_previews_preference ~= "enabled" then
+        local message = self.gamebanana_previews_preference == "never"
+            and "You can re-enable previews later from the menu code path or config if you change your mind."
+            or "Enable this panel to see the latest released mods for Space Channel 5 Part 2 right on the main menu."
+        love.graphics.setFont(theme.font("body"))
+        love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+        love.graphics.printf(message, feed_rect.x + 18, list_y + 20, feed_rect.w - 36, "left")
+
+        local button_rect = {
+            x = feed_rect.x + 18,
+            y = feed_rect.y + feed_rect.h - 58,
+            w = feed_rect.w - 36,
+            h = 38,
+        }
+        widgets.draw_button(button_rect, "Do you want to enable GameBanana previews?", {
+            font = theme.font("small"),
+            fill = self.gamebanana_previews_preference == "never" and theme.colors.button_disabled or theme.colors.selection_soft,
+            hover_fill = theme.colors.accent_soft,
+            border = self.gamebanana_previews_preference == "never" and theme.colors.border_soft or theme.colors.selection,
+            disabled = self.gamebanana_previews_preference == "never",
+            hovered = self.hovered_button == "release_enable_prompt",
+            radius = 10,
+        })
+        if self.gamebanana_previews_preference ~= "never" then
+            self.release_hits[#self.release_hits + 1] = {
+                id = "release_enable_prompt",
+                rect = button_rect,
+                action = "prompt_enable",
+            }
+        end
+        return
+    end
+    if self.release_feed.status == "loading" then
+        love.graphics.setFont(theme.font("body"))
+        love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+        love.graphics.printf("Loading recent releases...", feed_rect.x + 18, list_y + 16, feed_rect.w - 36, "left")
+        return
+    end
+    if self.release_feed.status == "error" then
+        love.graphics.setFont(theme.font("body"))
+        love.graphics.setColor(theme.colors.danger[1], theme.colors.danger[2], theme.colors.danger[3], 1)
+        love.graphics.printf(self.release_feed.error or "Recent releases are unavailable right now.", feed_rect.x + 18, list_y + 12, feed_rect.w - 36, "left")
+        return
+    end
+    if #self.release_feed.items == 0 then
+        love.graphics.setFont(theme.font("body"))
+        love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+        love.graphics.printf("No recent releases were found for Space Channel 5 Part 2.", feed_rect.x + 18, list_y + 12, feed_rect.w - 36, "left")
+        return
+    end
+
+    local card_gap = 12
+    local card_h = math.floor((feed_rect.h - 84 - card_gap * (#self.release_feed.items - 1)) / #self.release_feed.items)
+    for i = 1, #self.release_feed.items do
+        local item = self.release_feed.items[i]
+        local card = {
+            x = feed_rect.x + 14,
+            y = list_y + (i - 1) * (card_h + card_gap),
+            w = feed_rect.w - 28,
+            h = card_h,
+        }
+        widgets.draw_panel(card, {
+            fill = self.hovered_button == ("release_download_" .. i) and theme.colors.button_hover or theme.colors.panel,
+            border = theme.colors.border_soft,
+            radius = 16,
+        })
+
+        local thumb = {
+            x = card.x + 10,
+            y = card.y + 10,
+            w = 96,
+            h = card.h - 20,
+        }
+        widgets.draw_panel(thumb, {
+            fill = theme.colors.panel_alt,
+            border = theme.colors.border_soft,
+            radius = 12,
+        })
+
+        local image = self.release_images[tostring(item.id)]
+        if image then
+            local scale = math.min(thumb.w / image:getWidth(), thumb.h / image:getHeight())
+            local draw_w = image:getWidth() * scale
+            local draw_h = image:getHeight() * scale
+            local draw_x = thumb.x + math.floor((thumb.w - draw_w) * 0.5)
+            local draw_y = thumb.y + math.floor((thumb.h - draw_h) * 0.5)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.draw(image, draw_x, draw_y, 0, scale, scale)
+        else
+            love.graphics.setFont(theme.font("tiny"))
+            love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+            love.graphics.printf("No image", thumb.x, thumb.y + math.floor((thumb.h - theme.font("tiny"):getHeight()) * 0.5), thumb.w, "center")
+        end
+
+        local text_x = thumb.x + thumb.w + 12
+        local text_w = card.x + card.w - text_x - 12
+        love.graphics.setFont(theme.font("small"))
+        love.graphics.setColor(theme.colors.text[1], theme.colors.text[2], theme.colors.text[3], 1)
+        love.graphics.printf(item.name, text_x, card.y + 10, text_w, "left")
+
+        love.graphics.setFont(theme.font("tiny"))
+        love.graphics.setColor(theme.colors.text_dim[1], theme.colors.text_dim[2], theme.colors.text_dim[3], 1)
+        local byline = item.submitter_name ~= "" and ("by " .. item.submitter_name) or "GameBanana"
+        love.graphics.printf(byline, text_x, card.y + 30, text_w, "left")
+
+        local desc_font = theme.font("tiny")
+        love.graphics.setFont(desc_font)
+        love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
+        love.graphics.printf(clamp_text_lines(desc_font, item.description, text_w, 4), text_x, card.y + 48, text_w, "left")
+
+        local button_rect = {
+            x = card.x + card.w - 104,
+            y = card.y + card.h - 36,
+            w = 92,
+            h = 24,
+        }
+        widgets.draw_button(button_rect, "Download", {
+            font = theme.font("tiny"),
+            fill = theme.colors.selection_soft,
+            hover_fill = theme.colors.accent_soft,
+            border = theme.colors.selection,
+            hovered = self.hovered_button == ("release_download_" .. i),
+            radius = 8,
+        })
+        self.release_hits[#self.release_hits + 1] = {
+            id = "release_download_" .. i,
+            rect = button_rect,
+            uri = item.noize_uri,
+            action = "download",
+        }
+    end
 end
 
 function App:draw_entry_header(x, y, entry, max_width)
@@ -1670,6 +2527,36 @@ function App:noize_install_message(spec)
     return table.concat(lines, "\n")
 end
 
+function App:fetch_noize_metadata(spec)
+    if not spec or spec.source ~= "gamebanana" or not spec.item_id then
+        return nil
+    end
+
+    local item_cache_dir = join_path(self.release_cache_dir, "items")
+    local details, err = gamebanana.fetch_mod_details(item_cache_dir, spec.item_id)
+    if not details then
+        return nil, err
+    end
+
+    local preview_image = nil
+    if details.preview_url and details.preview_url ~= "" then
+        local preview_path = gamebanana.cache_preview_image({
+            id = details.id,
+            preview_url = details.preview_url,
+        }, item_cache_dir)
+        if preview_path then
+            preview_image = self:load_modal_image(preview_path)
+        end
+    end
+
+    return {
+        title = details.name ~= "" and details.name or nil,
+        author = details.author ~= "" and details.author or nil,
+        description = details.description ~= "" and details.description or nil,
+        image = preview_image,
+    }
+end
+
 function App:handle_noize_uri(uri)
     local spec, err = noize.parse(uri)
     if not spec then
@@ -1677,10 +2564,32 @@ function App:handle_noize_uri(uri)
         return false
     end
 
+    local meta = self:fetch_noize_metadata(spec)
+    local title = "Install Mod"
+    local message = self:noize_install_message(spec)
+    local image = nil
+    if meta then
+        local lines = {
+            meta.title or (spec.suggested_filename or "GameBanana Mod"),
+        }
+        if meta.author then
+            lines[#lines + 1] = "by " .. meta.author
+        end
+        if meta.description then
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = meta.description
+        end
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Noizemaker will download the archive and install it into your local mods library."
+        message = table.concat(lines, "\n")
+        image = meta.image
+    end
+
     self:switch_view("mods")
-    self:request_confirm(
-        "Install Mod",
-        self:noize_install_message(spec),
+    self:request_confirm_with_image(
+        title,
+        message,
+        image,
         "Install",
         function()
             local installed, install_err = modcore.install_remote_archive(spec.archive_url, self.mod_base_dir, spec.suggested_filename)
@@ -2285,12 +3194,23 @@ end
 function App:draw()
     self:draw_background()
     self:draw_topbar()
+    self:draw_editor_toolbar()
     self:draw_view_transition()
 
     love.graphics.setFont(theme.font("tiny"))
     love.graphics.setColor(theme.colors.text_muted[1], theme.colors.text_muted[2], theme.colors.text_muted[3], 1)
-    local status_x = self.active_view == "mods" and self.layout.mods.x or self.layout.timeline.x
-    local status_y = self.active_view == "mods" and (self.layout.mods.y + self.layout.mods.h + 4) or (self.layout.timeline.y + self.layout.timeline.h + 4)
+    local status_x
+    local status_y
+    if self.active_view == "mods" then
+        status_x = self.layout.mods.x
+        status_y = self.layout.mods.y + self.layout.mods.h + 4
+    elseif self.active_view == "menu" then
+        status_x = 18
+        status_y = love.graphics.getHeight() - 22
+    else
+        status_x = self.layout.timeline.x
+        status_y = self.layout.timeline.y + self.layout.timeline.h + 4
+    end
     love.graphics.print(self.status_text, status_x, status_y)
     self:draw_modal()
 end
@@ -2568,6 +3488,42 @@ end
 function App:draw_button_panel_message()
 end
 
+function App:activate_main_menu_button(button_id)
+    if button_id == "mods" then
+        self:prompt_noize_protocol_registration()
+        return
+    end
+    if button_id == "launch" then
+        self:launch_game()
+        return
+    end
+    if button_id == "editor" then
+        self:switch_view("editor")
+        self.status_text = "Entered editor."
+        return
+    end
+    if button_id == "settings" then
+        self:show_info("Settings", "A dedicated settings menu is coming later. This button is a placeholder for now.")
+        return
+    end
+end
+
+function App:activate_header_target(target_id)
+    if target_id == "main_menu" then
+        self:switch_view("menu")
+        self.status_text = "Returned to Main Menu."
+        return
+    end
+    if target_id == "editor" then
+        self:switch_view("editor")
+        return
+    end
+    if target_id == "mods" then
+        self:switch_view("mods")
+        return
+    end
+end
+
 function App:mousepressed(x, y, button)
     if self.modal then
         if button == 1 then
@@ -2585,31 +3541,75 @@ function App:mousepressed(x, y, button)
         return
     end
 
-    local buttons = self:buttons()
     if button == 1 then
-        if widgets.point_in_rect(x, y, buttons.open) then
-            self:open_file_dialog()
-            return
-        elseif widgets.point_in_rect(x, y, buttons.apply) then
-            if self.active_view == "editor" then
+        for i = 1, #self.header_hits do
+            local hit = self.header_hits[i]
+            if widgets.point_in_rect(x, y, hit.rect) then
+                if hit.kind == "back" then
+                    if not hit.disabled then
+                        self:switch_view("menu")
+                        self.status_text = "Returned to Main Menu."
+                    end
+                else
+                    self:activate_header_target(hit.id)
+                end
+                return
+            end
+        end
+    end
+
+    if self.active_view == "menu" then
+        if button == 1 then
+            for i = 1, #self.recent_hits do
+                local hit = self.recent_hits[i]
+                if widgets.point_in_rect(x, y, hit.rect) then
+                    if file_exists(hit.path) then
+                        self:open_file(hit.path)
+                        self:switch_view("editor")
+                    else
+                        self:show_error("Recent File", "That recent file could not be found anymore.")
+                    end
+                    return
+                end
+            end
+            for i = 1, #self.release_hits do
+                local hit = self.release_hits[i]
+                if widgets.point_in_rect(x, y, hit.rect) then
+                    if hit.action == "prompt_enable" then
+                        self:prompt_gamebanana_previews()
+                    elseif hit.action == "download" and hit.uri then
+                        self:handle_noize_uri(hit.uri)
+                    end
+                    return
+                end
+            end
+            for i = 1, #self.menu_hits do
+                local hit = self.menu_hits[i]
+                if widgets.point_in_rect(x, y, hit.rect) then
+                    self:activate_main_menu_button(hit.id)
+                    return
+                end
+            end
+        end
+        return
+    end
+
+    if self.active_view == "editor" then
+        local buttons = self:buttons()
+        if button == 1 then
+            if widgets.point_in_rect(x, y, buttons.open) then
+                self:open_file_dialog()
+                return
+            elseif widgets.point_in_rect(x, y, buttons.apply) then
                 self:apply_current_entry()
-            end
-            return
-        elseif widgets.point_in_rect(x, y, buttons.patch) then
-            if self.active_view == "editor" then
+                return
+            elseif widgets.point_in_rect(x, y, buttons.patch) then
                 self:patch_copy()
+                return
+            elseif widgets.point_in_rect(x, y, buttons.settings) then
+                self:prompt_for_game_root()
+                return
             end
-            return
-        elseif widgets.point_in_rect(x, y, buttons.settings) then
-            self:prompt_for_game_root()
-            return
-        elseif widgets.point_in_rect(x, y, buttons.mods) then
-            if self.active_view == "mods" then
-                self:switch_view("editor")
-            else
-                self:prompt_noize_protocol_registration()
-            end
-            return
         end
     end
 
@@ -2799,9 +3799,16 @@ function App:keypressed(key)
         return
     end
 
+    if self.active_view == "menu" then
+        if key == "return" or key == "kpenter" or key == "space" then
+            self:activate_main_menu_button("editor")
+        end
+        return
+    end
+
     if self.active_view == "mods" then
         if key == "escape" then
-            self:switch_view("editor")
+            self:switch_view("menu")
         end
         return
     end

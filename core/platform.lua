@@ -182,10 +182,15 @@ local function prompt_text_powershell(title, prompt, default_value)
 end
 
 function M.command_exists(name)
-    if IS_WINDOWS then
-        return run_status("where " .. tostring(name) .. " >NUL 2>NUL")
+    local command_name = trim(name)
+    if command_name == "" then
+        return false
     end
-    return run_status("command -v " .. sh_quote(name) .. " >/dev/null 2>&1")
+    if IS_WINDOWS then
+        local output = run_powershell("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $cmd = Get-Command '" .. command_name:gsub("'", "''") .. "' -ErrorAction SilentlyContinue; if ($cmd) { Write-Output $cmd.Source }")
+        return output ~= nil and output ~= ""
+    end
+    return run_status("command -v " .. sh_quote(command_name) .. " >/dev/null 2>&1")
 end
 
 function M.find_command_path(name)
@@ -195,7 +200,7 @@ function M.find_command_path(name)
     end
     local output
     if IS_WINDOWS then
-        output = read_command("where " .. command_name .. " 2>NUL")
+        output = run_powershell("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $cmd = Get-Command '" .. command_name:gsub("'", "''") .. "' -ErrorAction SilentlyContinue; if ($cmd) { Write-Output $cmd.Source }")
     else
         output = read_command("command -v " .. sh_quote(command_name) .. " 2>/dev/null")
     end
@@ -243,7 +248,11 @@ function M.ensure_dir(path)
         return false
     end
     if IS_WINDOWS then
-        return run_status("if not exist " .. cmd_quote(path) .. " mkdir " .. cmd_quote(path))
+        local script = {
+            "$target = '" .. tostring(path):gsub("'", "''") .. "'",
+            "if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null }",
+        }
+        return run_powershell_status(table.concat(script, "; "))
     end
     return run_status("mkdir -p " .. sh_quote(path))
 end
@@ -253,7 +262,11 @@ function M.remove_dir(path)
         return false
     end
     if IS_WINDOWS then
-        return run_status("if exist " .. cmd_quote(path) .. " rmdir /s /q " .. cmd_quote(path))
+        local script = {
+            "$target = '" .. tostring(path):gsub("'", "''") .. "'",
+            "if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop }",
+        }
+        return run_powershell_status(table.concat(script, "; "))
     end
     return run_status("rm -rf " .. sh_quote(path))
 end
@@ -263,7 +276,11 @@ function M.remove_file(path)
         return false
     end
     if IS_WINDOWS then
-        return run_status("if exist " .. cmd_quote(path) .. " del /f /q " .. cmd_quote(path))
+        local script = {
+            "$target = '" .. tostring(path):gsub("'", "''") .. "'",
+            "if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force -ErrorAction Stop }",
+        }
+        return run_powershell_status(table.concat(script, "; "))
     end
     return run_status("rm -f " .. sh_quote(path))
 end
@@ -273,7 +290,8 @@ function M.directory_exists(path)
         return false
     end
     if IS_WINDOWS then
-        return run_status("if exist " .. cmd_quote(path .. "\\*") .. " (exit /b 0) else (exit /b 1)")
+        local output = run_powershell("$target = '" .. tostring(path):gsub("'", "''") .. "'; if (Test-Path -LiteralPath $target -PathType Container) { Write-Output 'yes' }")
+        return output == "yes"
     end
     return run_status("[ -d " .. sh_quote(path) .. " ]")
 end
@@ -281,7 +299,20 @@ end
 function M.list_directories(path)
     local command
     if IS_WINDOWS then
-        command = 'dir /b /ad ' .. cmd_quote(path) .. ' 2>NUL'
+        local script = {
+            "$target = '" .. tostring(path):gsub("'", "''") .. "'",
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+            "if (Test-Path -LiteralPath $target -PathType Container) { Get-ChildItem -LiteralPath $target -Directory | ForEach-Object { Write-Output $_.Name } }",
+        }
+        local output = run_powershell(table.concat(script, "; "))
+        if not output then
+            return {}
+        end
+        local items = split_lines(output)
+        table.sort(items, function(a, b)
+            return a:lower() < b:lower()
+        end)
+        return items
     else
         command = 'find ' .. sh_quote(path) .. " -mindepth 1 -maxdepth 1 -type d -exec basename {} \\; 2>/dev/null"
     end
@@ -488,15 +519,6 @@ function M.download_file(url, destination)
 
     local lower_url = tostring(url):lower()
     local is_gamebanana = lower_url:match("^https?://[^/]*gamebanana%.com/") ~= nil
-    local curl_prefix = ""
-    if is_gamebanana then
-        curl_prefix = '-A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36" -e "https://gamebanana.com/" -H "Accept: application/octet-stream,*/*" '
-    end
-
-    if M.command_exists("curl") then
-        return run_status("curl -fsSL --max-redirs 5 " .. curl_prefix .. "-o " .. shell_quote(destination) .. " " .. shell_quote(url))
-    end
-
     if IS_WINDOWS then
         local script = { "$ProgressPreference = 'SilentlyContinue'" }
         if is_gamebanana then
@@ -506,6 +528,15 @@ function M.download_file(url, destination)
             script[#script + 1] = "Invoke-WebRequest -Uri '" .. tostring(url):gsub("'", "''") .. "' -MaximumRedirection 5 -OutFile '" .. tostring(destination):gsub("'", "''") .. "'"
         end
         return run_powershell_status(table.concat(script, "; "))
+    end
+
+    local curl_prefix = ""
+    if is_gamebanana then
+        curl_prefix = '-A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36" -e "https://gamebanana.com/" -H "Accept: application/octet-stream,*/*" '
+    end
+
+    if M.command_exists("curl") then
+        return run_status("curl -fsSL --max-redirs 5 " .. curl_prefix .. "-o " .. shell_quote(destination) .. " " .. shell_quote(url))
     end
 
     return false

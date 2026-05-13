@@ -41,12 +41,22 @@ M.colors = {
     button_disabled = { 0.11, 0.12, 0.16, 1.0 },
 }
 
+local function load_font(path, size)
+    if love.filesystem.getInfo(path) then
+        local ok, font = pcall(love.graphics.newFont, path, size)
+        if ok and font then
+            return font
+        end
+    end
+    return love.graphics.newFont(size)
+end
+
 function M.init()
     M.fonts = {
-        tiny = love.graphics.newFont(11),
-        small = love.graphics.newFont(13),
-        body = love.graphics.newFont(15),
-        title = love.graphics.newFont(22),
+        tiny = load_font("assets/DFHeiGB-W3.otf", 15),
+        small = load_font("assets/DFHeiGB-W3.otf", 15),
+        body = load_font("assets/DFHeiGB-W3.otf", 17),
+        title = load_font("assets/DFHeiGB-W3.otf", 24),
     }
 end
 

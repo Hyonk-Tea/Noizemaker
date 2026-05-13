@@ -157,11 +157,15 @@ function M.try_load_bitmap_title(path)
             char_to_index = char_to_index,
             cell_w = 30,
             cell_h = 30,
+            advance_w = 25,
         }
 
         function atlas:measure(text, scale)
             scale = scale or 1
-            return #text * self.cell_w * scale, self.cell_h * scale
+            if #text == 0 then
+                return 0, self.cell_h * scale
+            end
+            return ((#text - 1) * self.advance_w + self.cell_w) * scale, self.cell_h * scale
         end
 
         function atlas:draw(text, x, y, scale, color)
@@ -182,7 +186,7 @@ function M.try_load_bitmap_title(path)
                         scale
                     )
                 end
-                cursor_x = cursor_x + self.cell_w * scale
+                cursor_x = cursor_x + self.advance_w * scale
             end
         end
 
