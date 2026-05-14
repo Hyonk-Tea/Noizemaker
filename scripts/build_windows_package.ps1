@@ -115,12 +115,16 @@ Copy-Item -Path (Join-Path $loveExtracted.FullName "*") -Destination $packageRoo
 
 $loveExeSource = Join-Path $loveExtracted.FullName "love.exe"
 $loveExePackaged = Join-Path $packageRoot "love.exe"
+$noizemakerExe = Join-Path $packageRoot "noizemaker.exe"
 Assert-PathExists $loveExeSource "The downloaded LOVE runtime did not contain love.exe."
 Assert-PathExists $loveExePackaged "The LOVE runtime files were not copied into the package folder."
 
-Copy-FileBytes $loveExeSource (Join-Path $packageRoot "noizemaker.exe")
-Append-FileBytes (Join-Path $packageRoot "noizemaker.exe") $gameLove
-Set-ExeIcon (Join-Path $packageRoot "noizemaker.exe") $iconIco $rceditExe
+# Stamp the icon before appending the .love payload. Resource editors can
+# rewrite the PE file and discard any appended overlay bytes, which would
+# leave us with a plain LOVE runtime that opens to "no game".
+Copy-FileBytes $loveExeSource $noizemakerExe
+Set-ExeIcon $noizemakerExe $iconIco $rceditExe
+Append-FileBytes $noizemakerExe $gameLove
 
 Remove-Item -LiteralPath $loveExePackaged -Force
 Copy-Item -LiteralPath $gameLove -Destination (Join-Path $packageRoot "noizemaker.love") -Force
