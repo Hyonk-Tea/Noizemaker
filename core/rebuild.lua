@@ -105,6 +105,23 @@ local function bytes_to_string(bytes)
     return table.concat(parts)
 end
 
+local function rewrite_anim_indices_in_rest_body(rest_body, index_map)
+    local bytes = { string.byte(rest_body, 1, #rest_body) }
+    local pos = 1
+    while pos + 2 <= #bytes do
+        if (bytes[pos] == 0x43 or bytes[pos] == 0x44) and bytes[pos + 1] == 0x02 then
+            local old_idx = bytes[pos + 2]
+            if index_map[old_idx] ~= nil then
+                bytes[pos + 2] = index_map[old_idx]
+            end
+            pos = pos + 14
+        else
+            pos = pos + 2
+        end
+    end
+    return bytes_to_string(bytes)
+end
+
 local function collect_codes_and_hits(new_steps)
     local codes = {}
     local hits = {}
@@ -314,6 +331,13 @@ function M.rebuild_entry(entry, new_steps, options)
     end
 
     local rest_body = entry.rest_body
+    local synthesized_tail, synth_err = rules.synthesize_supported_special_anim_tail(entry, new_steps)
+    if synthesized_tail ~= nil then
+        rest_body = synthesized_tail
+    elseif synth_err == nil then
+        -- No special-tail rewrite was needed for this entry.
+    end
+
     local new_anim_indices = options.anim_indices
     if new_anim_indices ~= nil then
         local orig_indices = entry:get_anim_indices()
@@ -325,24 +349,12 @@ function M.rebuild_entry(entry, new_steps, options)
         for i = 1, #orig_indices do
             index_map[orig_indices[i]] = new_anim_indices[i]
         end
-
-        local bytes = { string.byte(rest_body, 1, #rest_body) }
-        local pos = 1
-        while pos + 2 <= #bytes do
-            if (bytes[pos] == 0x43 or bytes[pos] == 0x44) and bytes[pos + 1] == 0x02 then
-                local old_idx = bytes[pos + 2]
-                if index_map[old_idx] ~= nil then
-                    bytes[pos + 2] = index_map[old_idx]
-                end
-                pos = pos + 14
-            else
-                pos = pos + 2
-            end
-        end
-        rest_body = bytes_to_string(bytes)
+        rest_body = rewrite_anim_indices_in_rest_body(rest_body, index_map)
     end
 
-    rest_body = M.expand_local_id_list_if_needed(entry, rest_body, step_count)
+    if synthesized_tail == nil then
+        rest_body = M.expand_local_id_list_if_needed(entry, rest_body, step_count)
+    end
     parts[#parts + 1] = new_ff_prefix
     parts[#parts + 1] = rest_body
     return table.concat(parts)
