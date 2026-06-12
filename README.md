@@ -6,8 +6,6 @@ Noizemaker is a Space Channel 5 Part 2 rhythm editor and patcher.
 
 Ideally, download the packaged `.zip` from the Releases page.
 
-Tagged releases now also publish a Linux AppImage alongside the Windows package.
-
 If you want to run it from source instead, from the repo root:
 
 ```powershell
